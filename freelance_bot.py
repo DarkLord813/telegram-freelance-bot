@@ -18,9 +18,17 @@ from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler, 
     MessageHandler, filters, ContextTypes, ConversationHandler
 )
-from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Text, Boolean, ForeignKey
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker, relationship
+
+# SQLAlchemy with Python 3.14 fix - use version >= 2.0.37
+try:
+    from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Text, Boolean, ForeignKey
+    from sqlalchemy.ext.declarative import declarative_base
+    from sqlalchemy.orm import sessionmaker, relationship
+except (ImportError, AssertionError) as e:
+    print(f"⚠️ SQLAlchemy import error: {e}")
+    print("ℹ️ Try: pip install --upgrade sqlalchemy>=2.0.37")
+    raise
+
 import asyncio
 import re
 
