@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: telegram-freelance-bot
+    runtime: python
+    buildCommand: |
+      pyenv install 3.13.9 || true
+      pyenv global 3.13.9
+      python -m venv .venv
+      source .venv/bin/activate
+      pip install --upgrade pip
+      pip install -r requirements.txt
+    startCommand: python freelance_bot.py
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.13.9
