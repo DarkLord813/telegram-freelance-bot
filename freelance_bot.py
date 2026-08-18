@@ -208,7 +208,7 @@ class FreelanceBot:
         return True
 
     # ==================== MAIN MENU ====================
-    def get_main_menu(self):
+    def get_main_menu(self, is_admin=False):
         keyboard = [
             [InlineKeyboardButton("📋 Browse Jobs", callback_data="browse_jobs")],
             [InlineKeyboardButton("💰 Post a Job", callback_data="post_job")],
@@ -217,6 +217,9 @@ class FreelanceBot:
             [InlineKeyboardButton("⚙️ Settings", callback_data="settings")],
             [InlineKeyboardButton("❓ Help", callback_data="help")]
         ]
+        # Only show Admin Panel button if user is admin
+        if is_admin:
+            keyboard.append([InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")])
         return InlineKeyboardMarkup(keyboard)
 
     # ==================== ADMIN MENU ====================
@@ -401,18 +404,11 @@ class FreelanceBot:
                 "Use the buttons below to navigate:"
             )
             
-            if is_admin:
-                await update.message.reply_text(
-                    welcome_text,
-                    parse_mode='HTML',
-                    reply_markup=self.get_admin_menu()
-                )
-            else:
-                await update.message.reply_text(
-                    welcome_text,
-                    parse_mode='HTML',
-                    reply_markup=self.get_main_menu()
-                )
+            await update.message.reply_text(
+                welcome_text,
+                parse_mode='HTML',
+                reply_markup=self.get_main_menu(is_admin)
+            )
         else:
             currency_info = Config.CURRENCIES.get(db_user.currency, Config.CURRENCIES['USD'])
             role_emoji = "💼" if db_user.role == "client" else "💻" if db_user.role == "freelancer" else "🔀"
@@ -426,23 +422,18 @@ class FreelanceBot:
                 "Select an option below:"
             )
             
-            if is_admin:
-                await update.message.reply_text(
-                    welcome_back,
-                    parse_mode='HTML',
-                    reply_markup=self.get_admin_menu()
-                )
-            else:
-                await update.message.reply_text(
-                    welcome_back,
-                    parse_mode='HTML',
-                    reply_markup=self.get_main_menu()
-                )
+            await update.message.reply_text(
+                welcome_back,
+                parse_mode='HTML',
+                reply_markup=self.get_main_menu(is_admin)
+            )
         session.close()
 
     # ==================== TEXT HANDLER ====================
     async def text_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = update.message.text
+        user_id = update.effective_user.id
+        is_admin = user_id in Config.ADMIN_IDS
         
         # Handle job posting
         if context.user_data.get('posting_job'):
@@ -518,33 +509,22 @@ class FreelanceBot:
             await self.admin_unban_by_id(update, context, text)
         
         else:
-            is_admin = update.effective_user.id in Config.ADMIN_IDS
-            if is_admin:
-                await update.message.reply_text(
-                    "Please use the buttons to navigate.",
-                    reply_markup=self.get_admin_menu()
-                )
-            else:
-                await update.message.reply_text(
-                    "Please use the buttons to navigate.",
-                    reply_markup=self.get_main_menu()
-                )
+            await update.message.reply_text(
+                "Please use the buttons to navigate.",
+                reply_markup=self.get_main_menu(is_admin)
+            )
 
     async def photo_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        is_admin = user_id in Config.ADMIN_IDS
+        
         if context.user_data.get('broadcast'):
             await self.broadcast_photo(update, context)
         else:
-            is_admin = update.effective_user.id in Config.ADMIN_IDS
-            if is_admin:
-                await update.message.reply_text(
-                    "Please use the buttons to navigate.",
-                    reply_markup=self.get_admin_menu()
-                )
-            else:
-                await update.message.reply_text(
-                    "Please use the buttons to navigate.",
-                    reply_markup=self.get_main_menu()
-                )
+            await update.message.reply_text(
+                "Please use the buttons to navigate.",
+                reply_markup=self.get_main_menu(is_admin)
+            )
 
     # ==================== SAVE JOB ====================
     async def save_job(self, update: Update, context: ContextTypes.DEFAULT_TYPE, contact_info):
@@ -1006,20 +986,12 @@ class FreelanceBot:
         
         # ===== MAIN MENU =====
         if data == "main_menu":
-            if is_admin:
-                await query.edit_message_text(
-                    "🏠 <b>Main Menu</b>\n\n"
-                    "Select an option below:",
-                    parse_mode='HTML',
-                    reply_markup=self.get_admin_menu()
-                )
-            else:
-                await query.edit_message_text(
-                    "🏠 <b>Main Menu</b>\n\n"
-                    "Select an option below:",
-                    parse_mode='HTML',
-                    reply_markup=self.get_main_menu()
-                )
+            await query.edit_message_text(
+                "🏠 <b>Main Menu</b>\n\n"
+                "Select an option below:",
+                parse_mode='HTML',
+                reply_markup=self.get_main_menu(is_admin)
+            )
             return
         
         # ===== HELP =====
@@ -1896,16 +1868,10 @@ class FreelanceBot:
         elif data == "check_joined":
             if await self.check_force_join(update, context):
                 is_admin = update.effective_user.id in Config.ADMIN_IDS
-                if is_admin:
-                    await query.edit_message_text(
-                        "✅ Thank you for joining!",
-                        reply_markup=self.get_admin_menu()
-                    )
-                else:
-                    await query.edit_message_text(
-                        "✅ Thank you for joining!",
-                        reply_markup=self.get_main_menu()
-                    )
+                await query.edit_message_text(
+                    "✅ Thank you for joining!",
+                    reply_markup=self.get_main_menu(is_admin)
+                )
             return
 
     # ==================== RUN ====================
