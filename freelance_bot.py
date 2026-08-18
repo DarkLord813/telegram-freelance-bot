@@ -25,13 +25,13 @@ class Config:
     RECEIVER_USERNAME = 'rexoronsaye'
     RECEIVER_TELEGRAM_ID = 7713987088
     
+    # Force join channels with usernames and IDs
     FORCE_JOIN_CHANNELS = [
-        'https://t.me/PulseProfit012',
-        'https://t.me/moneyplugngx',
-        'https://t.me/aidropupdatesx',
-        'https://t.me/PulseProfitWithdrawals'
+        {'username': 'PulseProfit012', 'id': -1003931660594, 'url': 'https://t.me/PulseProfit012'},
+        {'username': 'moneyplugngx', 'id': -1004466219117, 'url': 'https://t.me/moneyplugngx'},
+        {'username': 'aidropupdatesx', 'id': -1004412219960, 'url': 'https://t.me/aidropupdatesx'},
+        {'username': 'PulseProfitWithdrawals', 'id': -1004322387526, 'url': 'https://t.me/PulseProfitWithdrawals'}
     ]
-    CHANNEL_USERNAMES = ['PulseProfit012', 'moneyplugngx', 'aidropupdatesx', 'PulseProfitWithdrawals']
     
     CURRENCIES = {
         'USD': {'symbol': '$', 'name': 'US Dollar', 'emoji': '🇺🇸'},
@@ -167,34 +167,50 @@ class FreelanceBot:
     async def check_force_join(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
         
-        for channel in Config.CHANNEL_USERNAMES:
+        # Get user's chat member status for each channel
+        not_joined = []
+        
+        for channel in Config.FORCE_JOIN_CHANNELS:
             try:
-                member = await context.bot.get_chat_member(f"@{channel}", user_id)
+                # Try using channel ID first (more reliable)
+                try:
+                    member = await context.bot.get_chat_member(chat_id=channel['id'], user_id=user_id)
+                except:
+                    # Fallback to username
+                    member = await context.bot.get_chat_member(chat_id=f"@{channel['username']}", user_id=user_id)
+                
                 if member.status not in ['member', 'administrator', 'creator']:
-                    keyboard = []
-                    for ch in Config.FORCE_JOIN_CHANNELS:
-                        keyboard.append([InlineKeyboardButton("📢 Join Channel", url=ch)])
-                    keyboard.append([InlineKeyboardButton("✅ I've Joined", callback_data="check_joined")])
-                    
-                    if update.message:
-                        await update.message.reply_text(
-                            "⚠️ <b>Please join our channels first!</b>\n\n"
-                            "You need to join all channels to use this bot.\n"
-                            "Click the buttons below to join:",
-                            parse_mode='HTML',
-                            reply_markup=InlineKeyboardMarkup(keyboard)
-                        )
-                    else:
-                        await update.callback_query.edit_message_text(
-                            "⚠️ <b>Please join our channels first!</b>\n\n"
-                            "You need to join all channels to use this bot.\n"
-                            "Click the buttons below to join:",
-                            parse_mode='HTML',
-                            reply_markup=InlineKeyboardMarkup(keyboard)
-                        )
-                    return False
-            except:
-                pass
+                    not_joined.append(channel)
+            except Exception as e:
+                logger.error(f"Error checking channel {channel['username']}: {e}")
+                not_joined.append(channel)
+        
+        if not_joined:
+            keyboard = []
+            for channel in not_joined:
+                keyboard.append([InlineKeyboardButton(f"📢 Join {channel['username']}", url=channel['url'])])
+            keyboard.append([InlineKeyboardButton("✅ I've Joined All", callback_data="check_joined")])
+            
+            message_text = (
+                "⚠️ <b>Please join our channels first!</b>\n\n"
+                "You need to join all channels to use this bot.\n"
+                "Click the buttons below to join each channel:\n\n"
+                "After joining all, click <b>'I've Joined All'</b> to continue."
+            )
+            
+            if update.message:
+                await update.message.reply_text(
+                    message_text,
+                    parse_mode='HTML',
+                    reply_markup=InlineKeyboardMarkup(keyboard)
+                )
+            else:
+                await update.callback_query.edit_message_text(
+                    message_text,
+                    parse_mode='HTML',
+                    reply_markup=InlineKeyboardMarkup(keyboard)
+                )
+            return False
         
         return True
 
