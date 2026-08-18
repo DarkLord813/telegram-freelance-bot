@@ -10,6 +10,7 @@ import threading
 import shutil
 import sqlite3
 import time
+import requests
 from datetime import datetime, timedelta
 from pathlib import Path
 from dotenv import load_dotenv
@@ -19,15 +20,9 @@ from telegram.ext import (
     MessageHandler, filters, ContextTypes, ConversationHandler
 )
 
-# SQLAlchemy with Python 3.14 fix - use version >= 2.0.37
-try:
-    from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Text, Boolean, ForeignKey
-    from sqlalchemy.ext.declarative import declarative_base
-    from sqlalchemy.orm import sessionmaker, relationship
-except (ImportError, AssertionError) as e:
-    print(f"⚠️ SQLAlchemy import error: {e}")
-    print("ℹ️ Try: pip install --upgrade sqlalchemy>=2.0.37")
-    raise
+# SQLAlchemy with Python 3.13 fix - use version >= 2.0.37
+from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Text, Boolean, ForeignKey
+from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 
 import asyncio
 import re
@@ -116,43 +111,84 @@ def _gh_api(method, path, payload=None):
     except Exception as ex:
         return 0, {"error": str(ex)}
 
-def _db_has_data():
-    """Return True only when the database contains real rows."""
-    if not DATABASE_FILE.exists():
-        return False
-    if DATABASE_FILE.stat().st_size < 8192:
-        return False
+def _get_db_stats(db_path):
+    """Get user and job counts from a database file."""
     try:
-        conn = sqlite3.connect(str(DATABASE_FILE))
+        conn = sqlite3.connect(str(db_path))
         c = conn.cursor()
         c.execute("SELECT COUNT(*) FROM users")
         users = c.fetchone()[0]
         c.execute("SELECT COUNT(*) FROM jobs")
         jobs = c.fetchone()[0]
         conn.close()
-        return users > 0 or jobs > 0
+        return users, jobs
     except Exception:
+        return 0, 0
+
+def _get_github_db_stats():
+    """Get user and job counts from GitHub backup without downloading full DB."""
+    if not Config.GITHUB_ENABLED:
+        return None, None
+    
+    status, resp = _gh_api("GET", Config.GITHUB_BACKUP_PATH)
+    if status != 200:
+        return None, None
+    
+    try:
+        raw_b64 = resp.get("content", "").replace("\n", "")
+        db_bytes = base64.b64decode(raw_b64)
+        temp_db = DATABASE_FILE.parent / "temp_github_stats.db"
+        with open(temp_db, "wb") as f:
+            f.write(db_bytes)
+        users, jobs = _get_db_stats(temp_db)
+        temp_db.unlink()
+        return users, jobs
+    except Exception:
+        return None, None
+
+def _db_has_data():
+    """Return True only when the database contains real rows."""
+    if not DATABASE_FILE.exists():
         return False
+    if DATABASE_FILE.stat().st_size < 8192:
+        return False
+    users, jobs = _get_db_stats(DATABASE_FILE)
+    return users > 0 or jobs > 0
 
 def github_restore_db():
     """
     Download the database from GitHub and write to freelance_bot.db.
-    Called automatically on startup.
+    ONLY restores if GitHub has MORE data than local.
     """
     if not Config.GITHUB_ENABLED:
         print("ℹ️ GitHub backup not configured — skipping restore")
         return False
 
-    print(f"🔄 Restoring from GitHub → "
+    print(f"🔄 Checking GitHub backup → "
           f"{Config.GITHUB_REPO_OWNER}/{Config.GITHUB_REPO_NAME}/{Config.GITHUB_BACKUP_PATH}")
 
-    status, resp = _gh_api("GET", Config.GITHUB_BACKUP_PATH)
-
-    if status == 404:
+    # Get local stats
+    local_users, local_jobs = _get_db_stats(DATABASE_FILE) if DATABASE_FILE.exists() else (0, 0)
+    
+    # Get GitHub stats
+    github_users, github_jobs = _get_github_db_stats()
+    
+    if github_users is None:
         print("ℹ️ No backup found on GitHub — starting fresh")
         return False
+
+    print(f"📊 Local: {local_users} users, {local_jobs} jobs")
+    print(f"📊 GitHub: {github_users} users, {github_jobs} jobs")
+
+    # Only restore if GitHub has more data
+    if github_users <= local_users and github_jobs <= local_jobs:
+        print("ℹ️ Local database has equal or more data — skipping restore")
+        return False
+
+    # Download and restore
+    status, resp = _gh_api("GET", Config.GITHUB_BACKUP_PATH)
     if status != 200:
-        print(f"⚠️ GitHub restore HTTP {status}: {resp.get('message', resp)}")
+        print(f"⚠️ GitHub restore HTTP {status}")
         return False
 
     try:
@@ -166,12 +202,19 @@ def github_restore_db():
         # Close any open connections
         Session.close_all()
         
+        # Backup local before overwriting
+        if DATABASE_FILE.exists():
+            backup_file = DATABASE_FILE.parent / f"pre_restore_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
+            shutil.copy2(DATABASE_FILE, backup_file)
+            print(f"📁 Local backup saved: {backup_file.name}")
+        
         with open(DATABASE_FILE, "wb") as f:
             f.write(db_bytes)
 
         size_kb = len(db_bytes) / 1024
-        print(f"✅ Database restored from GitHub ({size_kb:.1f} KB)")
+        print(f"✅ Database restored from GitHub ({size_kb:.1f} KB) — GitHub has more data")
         return True
+
     except Exception as e:
         print(f"❌ GitHub restore error: {e}")
         return False
@@ -179,14 +222,36 @@ def github_restore_db():
 def github_backup_db(reason: str = "auto", force: bool = False):
     """
     Upload freelance_bot.db to GitHub. Thread-safe via push lock.
+    ONLY backs up if local has MORE data than GitHub.
     """
     global _last_backup_time
 
     if not Config.GITHUB_ENABLED:
         return False
+
+    # Check if local database has data
     if not _db_has_data():
-        print(f"⏭️ Backup skipped ({reason}): database has no data")
+        print(f"⏭️ Backup skipped ({reason}): local database has no data")
         return False
+
+    # Get local stats
+    local_users, local_jobs = _get_db_stats(DATABASE_FILE)
+    
+    # Get GitHub stats
+    github_users, github_jobs = _get_github_db_stats()
+    
+    print(f"📊 Local: {local_users} users, {local_jobs} jobs")
+    if github_users is not None:
+        print(f"📊 GitHub: {github_users} users, {github_jobs} jobs")
+    else:
+        print("📊 GitHub: No backup found")
+
+    # Only backup if local has more data than GitHub
+    # If GitHub doesn't exist, always backup
+    if github_users is not None:
+        if local_users <= github_users and local_jobs <= github_jobs and not force:
+            print(f"⏭️ Backup skipped: local data not newer than GitHub")
+            return False
 
     now = time.time()
     if not force and now - _last_backup_time < _MIN_BACKUP_INTERVAL:
@@ -212,7 +277,7 @@ def github_backup_db(reason: str = "auto", force: bool = False):
         status, resp = _gh_api("GET", Config.GITHUB_BACKUP_PATH)
         if status == 200:
             sha = resp.get("sha")
-        elif status not in (200, 404):
+        elif status != 404:
             print(f"⚠️ GitHub SHA lookup failed (HTTP {status})")
             return False
 
@@ -228,7 +293,8 @@ def github_backup_db(reason: str = "auto", force: bool = False):
 
         if status in (200, 201):
             _last_backup_time = time.time()
-            print(f"✅ DB backed up to GitHub ({len(db_bytes)/1024:.1f} KB) — {reason}")
+            users, jobs = _get_db_stats(DATABASE_FILE)
+            print(f"✅ DB backed up to GitHub ({len(db_bytes)/1024:.1f} KB) — {users} users, {jobs} jobs")
             return True
         else:
             print(f"⚠️ GitHub backup HTTP {status}: {resp.get('message', resp)}")
@@ -249,7 +315,7 @@ def async_backup(reason: str = "auto"):
         ).start()
 
 def _periodic_backup_thread():
-    """Safety-net: flush a backup every 30 minutes."""
+    """Safety-net: flush a backup every 30 minutes if local has more data."""
     time.sleep(300)
     while True:
         try:
@@ -370,7 +436,7 @@ class FreelanceBot:
         if restore_success:
             print("✅ Database restored from GitHub")
         else:
-            print("ℹ️ No backup found or restore skipped — using existing/local DB")
+            print("ℹ️ No backup restored — using existing/local DB")
         print("=" * 60)
         
         # Now initialize database
@@ -380,8 +446,27 @@ class FreelanceBot:
         threading.Thread(target=_periodic_backup_thread, daemon=True, name="PeriodicBackup").start()
         
         self.application = Application.builder().token(Config.BOT_TOKEN).build()
+        
+        # Delete webhook to avoid conflict
+        self._delete_webhook()
+        
         self.setup_handlers()
         logger.info("Bot initialized successfully!")
+        
+    def _delete_webhook(self):
+        """Delete any existing webhook before starting."""
+        try:
+            response = requests.post(
+                f"https://api.telegram.org/bot{Config.BOT_TOKEN}/deleteWebhook",
+                json={"drop_pending_updates": True},
+                timeout=10
+            )
+            if response.status_code == 200:
+                print("✅ Webhook deleted successfully")
+            else:
+                print(f"⚠️ Webhook deletion response: {response.text}")
+        except Exception as e:
+            print(f"⚠️ Webhook deletion error: {e}")
         
     def setup_handlers(self):
         self.application.add_handler(CommandHandler('start', self.start))
@@ -1303,7 +1388,7 @@ class FreelanceBot:
             await update.callback_query.edit_message_text("❌ You are not an admin.")
             return
         
-        await update.callback_query.edit_message_text("🔄 Backing up database to GitHub...")
+        await update.callback_query.edit_message_text("🔄 Checking database status...")
         
         if not Config.GITHUB_ENABLED:
             await update.callback_query.edit_message_text(
@@ -1316,10 +1401,34 @@ class FreelanceBot:
             )
             return
         
+        # Get stats for comparison
+        local_users, local_jobs = _get_db_stats(DATABASE_FILE) if DATABASE_FILE.exists() else (0, 0)
+        github_users, github_jobs = _get_github_db_stats()
+        
+        if github_users is None:
+            status_msg = "ℹ️ No GitHub backup found. Creating first backup..."
+        elif local_users <= github_users and local_jobs <= github_jobs:
+            await update.callback_query.edit_message_text(
+                f"⏭️ <b>Backup Skipped</b>\n\n"
+                f"Local database has <b>LESS</b> or equal data than GitHub.\n\n"
+                f"📊 Local: {local_users} users, {local_jobs} jobs\n"
+                f"📊 GitHub: {github_users} users, {github_jobs} jobs\n\n"
+                f"Backup only runs when local has MORE data.",
+                parse_mode='HTML',
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]])
+            )
+            return
+        else:
+            status_msg = f"✅ Local has more data ({local_users} users > {github_users} users). Backing up..."
+        
+        await update.callback_query.edit_message_text(status_msg)
+        
         success = github_backup_db(reason=f"manual_admin_{user_id}", force=True)
         if success:
+            local_users, local_jobs = _get_db_stats(DATABASE_FILE)
             await update.callback_query.edit_message_text(
-                "✅ Database backed up to GitHub successfully!",
+                f"✅ Database backed up to GitHub successfully!\n\n"
+                f"📊 {local_users} users, {local_jobs} jobs",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]])
             )
         else:
@@ -1335,11 +1444,37 @@ class FreelanceBot:
             await update.callback_query.edit_message_text("❌ You are not an admin.")
             return
         
+        # Check if GitHub has more data
+        local_users, local_jobs = _get_db_stats(DATABASE_FILE) if DATABASE_FILE.exists() else (0, 0)
+        github_users, github_jobs = _get_github_db_stats()
+        
+        if github_users is None:
+            await update.callback_query.edit_message_text(
+                "❌ No backup found on GitHub.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]])
+            )
+            return
+        
+        if github_users <= local_users and github_jobs <= local_jobs:
+            await update.callback_query.edit_message_text(
+                f"⏭️ <b>Restore Skipped</b>\n\n"
+                f"GitHub has <b>LESS</b> or equal data than local.\n\n"
+                f"📊 Local: {local_users} users, {local_jobs} jobs\n"
+                f"📊 GitHub: {github_users} users, {github_jobs} jobs\n\n"
+                f"Restore only runs when GitHub has MORE data.",
+                parse_mode='HTML',
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]])
+            )
+            return
+        
         await update.callback_query.edit_message_text(
-            "⚠️ <b>RESTORE DATABASE FROM GITHUB</b>\n\n"
-            "This will REPLACE the current database with the backup from GitHub.\n"
-            "All current data will be lost!\n\n"
-            "Are you sure?",
+            f"⚠️ <b>RESTORE DATABASE FROM GITHUB</b>\n\n"
+            f"GitHub has <b>MORE</b> data than local.\n\n"
+            f"📊 Local: {local_users} users, {local_jobs} jobs\n"
+            f"📊 GitHub: {github_users} users, {github_jobs} jobs\n\n"
+            f"This will REPLACE the current database with the backup from GitHub.\n"
+            f"All current data will be lost!\n\n"
+            f"Are you sure?",
             parse_mode='HTML',
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("✅ Yes, Restore", callback_data="confirm_restore")],
@@ -1367,9 +1502,12 @@ class FreelanceBot:
         
         success = github_restore_db()
         if success:
+            users, jobs = _get_db_stats(DATABASE_FILE)
             await update.callback_query.edit_message_text(
-                "✅ Database restored from GitHub successfully!\n\n"
-                "The bot will restart to apply changes.",
+                f"✅ Database restored from GitHub successfully!\n\n"
+                f"📊 {users} users, {jobs} jobs\n\n"
+                f"The bot will restart to apply changes.",
+                parse_mode='HTML',
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("🔄 Restart Bot", callback_data="restart_bot")],
                     [InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]
@@ -1399,12 +1537,14 @@ class FreelanceBot:
         
         # Send the database file
         try:
+            users, jobs = _get_db_stats(DATABASE_FILE)
             with open(DATABASE_FILE, 'rb') as f:
                 await context.bot.send_document(
                     chat_id=user_id,
                     document=f,
                     filename=f"freelance_bot_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db",
                     caption=f"💾 Database backup - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                            f"📊 {users} users, {jobs} jobs\n"
                             f"Size: {DATABASE_FILE.stat().st_size / 1024:.1f} KB"
                 )
             
@@ -1440,13 +1580,19 @@ class FreelanceBot:
         
         session.close()
         
+        # Get GitHub stats
+        github_users, github_jobs = _get_github_db_stats()
+        github_status = f"{github_users} users, {github_jobs} jobs" if github_users is not None else "No backup"
+        
         await update.callback_query.edit_message_text(
             f"📊 <b>Statistics</b>\n\n"
             f"👤 Users: {total_users} (Banned: {banned_users})\n"
             f"📋 Reports: {total_reports} (Pending: {pending_reports})\n"
             f"💼 Jobs: {total_jobs} (Active: {active_jobs})\n"
             f"⭐ Ratings: {total_ratings}\n"
-            f"💰 Payments: {total_payments} (Pending: {pending_payments}, Completed: {completed_payments})",
+            f"💰 Payments: {total_payments} (Pending: {pending_payments}, Completed: {completed_payments})\n\n"
+            f"☁️ <b>GitHub Backup:</b>\n"
+            f"📊 {github_status}",
             parse_mode='HTML',
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_panel")]])
         )
@@ -2430,6 +2576,22 @@ class FreelanceBot:
 
     # ==================== RUN ====================
     def run(self):
+        """Start the bot with webhook cleanup."""
+        # Force delete webhook before starting
+        try:
+            response = requests.post(
+                f"https://api.telegram.org/bot{Config.BOT_TOKEN}/deleteWebhook",
+                json={"drop_pending_updates": True},
+                timeout=10
+            )
+            if response.status_code == 200:
+                print("✅ Webhook deleted successfully")
+            else:
+                print(f"⚠️ Webhook deletion response: {response.text}")
+        except Exception as e:
+            print(f"⚠️ Webhook deletion error: {e}")
+        
+        # Start polling
         self.application.run_polling()
 
 if __name__ == '__main__':
