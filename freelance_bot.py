@@ -2,7 +2,16 @@
 
 import logging
 import os
+import json
+import base64
+import urllib.request
+import urllib.parse
+import threading
+import shutil
+import sqlite3
+import time
 from datetime import datetime, timedelta
+from pathlib import Path
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -13,6 +22,7 @@ from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, 
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
 import asyncio
+import re
 
 load_dotenv()
 
@@ -22,10 +32,18 @@ class Config:
     REPORT_THRESHOLD = 5
     UNBAN_FEE = 50
     
+    # YOUR Telegram account details
     RECEIVER_USERNAME = 'rexoronsaye'
     RECEIVER_TELEGRAM_ID = 7713987088
     
-    # Force join channels with usernames and IDs
+    # GitHub Backup Configuration
+    GITHUB_TOKEN = os.getenv('GITHUB_TOKEN', '')
+    GITHUB_REPO_OWNER = os.getenv('GITHUB_REPO_OWNER', '')
+    GITHUB_REPO_NAME = os.getenv('GITHUB_REPO_NAME', '')
+    GITHUB_BACKUP_BRANCH = os.getenv('GITHUB_BACKUP_BRANCH', 'main')
+    GITHUB_BACKUP_PATH = os.getenv('GITHUB_BACKUP_PATH', 'backups/freelance_bot.db')
+    GITHUB_ENABLED = bool(GITHUB_TOKEN and GITHUB_REPO_OWNER and GITHUB_REPO_NAME)
+    
     FORCE_JOIN_CHANNELS = [
         {'username': 'PulseProfit012', 'id': -1003931660594, 'url': 'https://t.me/PulseProfit012'},
         {'username': 'moneyplugngx', 'id': -1004466219117, 'url': 'https://t.me/moneyplugngx'},
@@ -51,9 +69,188 @@ class Config:
     }
     DEFAULT_CURRENCY = 'USD'
 
+# ==================== DATABASE SETUP ====================
+
+DATABASE_FILE = Path('freelance_bot.db')
 Base = declarative_base()
-engine = create_engine('sqlite:///freelance_bot.db')
+engine = create_engine(f'sqlite:///{DATABASE_FILE}')
 Session = sessionmaker(bind=engine)
+
+# ==================== GITHUB BACKUP SYSTEM ====================
+
+_github_push_lock = threading.Lock()
+_last_backup_time = 0.0
+_MIN_BACKUP_INTERVAL = 30
+
+def _gh_api(method, path, payload=None):
+    """Raw GitHub Contents API call. Returns (http_status, response_dict)."""
+    if not Config.GITHUB_ENABLED:
+        return 0, {"error": "GitHub not configured"}
+    
+    url = (f"https://api.github.com/repos/{Config.GITHUB_REPO_OWNER}/"
+           f"{Config.GITHUB_REPO_NAME}/contents/{path}")
+    headers = {
+        "Authorization": f"Bearer {Config.GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "Content-Type": "application/json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    body = json.dumps(payload).encode() if payload else None
+    req = urllib.request.Request(url, data=body, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return r.status, json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        try:
+            return e.code, json.loads(e.read())
+        except:
+            return e.code, {}
+    except Exception as ex:
+        return 0, {"error": str(ex)}
+
+def _db_has_data():
+    """Return True only when the database contains real rows."""
+    if not DATABASE_FILE.exists():
+        return False
+    if DATABASE_FILE.stat().st_size < 8192:
+        return False
+    try:
+        conn = sqlite3.connect(str(DATABASE_FILE))
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM users")
+        users = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM jobs")
+        jobs = c.fetchone()[0]
+        conn.close()
+        return users > 0 or jobs > 0
+    except Exception:
+        return False
+
+def github_restore_db():
+    """
+    Download the database from GitHub and write to freelance_bot.db.
+    Called automatically on startup.
+    """
+    if not Config.GITHUB_ENABLED:
+        print("ℹ️ GitHub backup not configured — skipping restore")
+        return False
+
+    print(f"🔄 Restoring from GitHub → "
+          f"{Config.GITHUB_REPO_OWNER}/{Config.GITHUB_REPO_NAME}/{Config.GITHUB_BACKUP_PATH}")
+
+    status, resp = _gh_api("GET", Config.GITHUB_BACKUP_PATH)
+
+    if status == 404:
+        print("ℹ️ No backup found on GitHub — starting fresh")
+        return False
+    if status != 200:
+        print(f"⚠️ GitHub restore HTTP {status}: {resp.get('message', resp)}")
+        return False
+
+    try:
+        raw_b64 = resp.get("content", "").replace("\n", "")
+        db_bytes = base64.b64decode(raw_b64)
+
+        if len(db_bytes) < 1024:
+            print("⚠️ GitHub backup is too small — skipping restore")
+            return False
+
+        # Close any open connections
+        Session.close_all()
+        
+        with open(DATABASE_FILE, "wb") as f:
+            f.write(db_bytes)
+
+        size_kb = len(db_bytes) / 1024
+        print(f"✅ Database restored from GitHub ({size_kb:.1f} KB)")
+        return True
+    except Exception as e:
+        print(f"❌ GitHub restore error: {e}")
+        return False
+
+def github_backup_db(reason: str = "auto", force: bool = False):
+    """
+    Upload freelance_bot.db to GitHub. Thread-safe via push lock.
+    """
+    global _last_backup_time
+
+    if not Config.GITHUB_ENABLED:
+        return False
+    if not _db_has_data():
+        print(f"⏭️ Backup skipped ({reason}): database has no data")
+        return False
+
+    now = time.time()
+    if not force and now - _last_backup_time < _MIN_BACKUP_INTERVAL:
+        return False
+
+    if force:
+        acquired = _github_push_lock.acquire(blocking=True, timeout=15)
+    else:
+        acquired = _github_push_lock.acquire(blocking=False)
+    if not acquired:
+        return False
+
+    try:
+        with open(DATABASE_FILE, "rb") as f:
+            db_bytes = f.read()
+
+        if len(db_bytes) < 1024:
+            return False
+
+        content_b64 = base64.b64encode(db_bytes).decode()
+
+        sha = None
+        status, resp = _gh_api("GET", Config.GITHUB_BACKUP_PATH)
+        if status == 200:
+            sha = resp.get("sha")
+        elif status not in (200, 404):
+            print(f"⚠️ GitHub SHA lookup failed (HTTP {status})")
+            return False
+
+        commit = {
+            "message": f"backup: {reason} — {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}",
+            "content": content_b64,
+            "branch": Config.GITHUB_BACKUP_BRANCH,
+        }
+        if sha:
+            commit["sha"] = sha
+
+        status, resp = _gh_api("PUT", Config.GITHUB_BACKUP_PATH, commit)
+
+        if status in (200, 201):
+            _last_backup_time = time.time()
+            print(f"✅ DB backed up to GitHub ({len(db_bytes)/1024:.1f} KB) — {reason}")
+            return True
+        else:
+            print(f"⚠️ GitHub backup HTTP {status}: {resp.get('message', resp)}")
+            return False
+
+    except Exception as e:
+        print(f"❌ GitHub backup error: {e}")
+        return False
+    finally:
+        _github_push_lock.release()
+
+def async_backup(reason: str = "auto"):
+    """Fire-and-forget backup."""
+    if Config.GITHUB_ENABLED:
+        threading.Thread(
+            target=github_backup_db, args=(reason,),
+            daemon=True, name="GitHubBackup"
+        ).start()
+
+def _periodic_backup_thread():
+    """Safety-net: flush a backup every 30 minutes."""
+    time.sleep(300)
+    while True:
+        try:
+            github_backup_db("periodic")
+        except Exception as e:
+            print(f"⚠️ Periodic backup error: {e}")
+        time.sleep(1800)
+
+# ==================== DATABASE MODELS ====================
 
 class User(Base):
     __tablename__ = 'users'
@@ -137,13 +334,18 @@ class BroadcastMessage(Base):
     failed_count = Column(Integer, default=0)
     created_at = Column(DateTime, default=datetime.utcnow)
 
-Base.metadata.create_all(engine)
+def init_db():
+    """Create tables if they don't exist."""
+    Base.metadata.create_all(engine)
+
+# ==================== CONVERSATION STATES ====================
 
 TITLE, DESCRIPTION, CATEGORY, CURRENCY, BUDGET_MIN, BUDGET_MAX, CONTACT_METHOD, CONTACT_INFO = range(8)
 RATING_SCORE, RATING_REVIEW = range(2)
 REPORT_REASON = range(1)
 BROADCAST_PHOTO, BROADCAST_CAPTION, BROADCAST_BUTTONS = range(3)
 UNBAN_PAYMENT = range(1)
+SEARCH_USERS = range(1)
 
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -153,6 +355,22 @@ logger = logging.getLogger(__name__)
 
 class FreelanceBot:
     def __init__(self):
+        # Restore from GitHub FIRST before anything else
+        print("=" * 60)
+        print("🔍 Checking for GitHub backup...")
+        restore_success = github_restore_db()
+        if restore_success:
+            print("✅ Database restored from GitHub")
+        else:
+            print("ℹ️ No backup found or restore skipped — using existing/local DB")
+        print("=" * 60)
+        
+        # Now initialize database
+        init_db()
+        
+        # Start periodic backup thread
+        threading.Thread(target=_periodic_backup_thread, daemon=True, name="PeriodicBackup").start()
+        
         self.application = Application.builder().token(Config.BOT_TOKEN).build()
         self.setup_handlers()
         logger.info("Bot initialized successfully!")
@@ -167,50 +385,37 @@ class FreelanceBot:
     async def check_force_join(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
         
-        # Get user's chat member status for each channel
-        not_joined = []
-        
         for channel in Config.FORCE_JOIN_CHANNELS:
             try:
-                # Try using channel ID first (more reliable)
-                try:
-                    member = await context.bot.get_chat_member(chat_id=channel['id'], user_id=user_id)
-                except:
-                    # Fallback to username
-                    member = await context.bot.get_chat_member(chat_id=f"@{channel['username']}", user_id=user_id)
-                
+                member = await context.bot.get_chat_member(chat_id=channel['id'], user_id=user_id)
                 if member.status not in ['member', 'administrator', 'creator']:
-                    not_joined.append(channel)
+                    keyboard = []
+                    for ch in Config.FORCE_JOIN_CHANNELS:
+                        keyboard.append([InlineKeyboardButton(f"📢 Join {ch['username']}", url=ch['url'])])
+                    keyboard.append([InlineKeyboardButton("✅ I've Joined All", callback_data="check_joined")])
+                    
+                    if update.message:
+                        await update.message.reply_text(
+                            "⚠️ <b>Please join our channels first!</b>\n\n"
+                            "You need to join all channels to use this bot.\n"
+                            "Click the buttons below to join each channel:\n\n"
+                            "After joining all, click <b>'I've Joined All'</b> to continue.",
+                            parse_mode='HTML',
+                            reply_markup=InlineKeyboardMarkup(keyboard)
+                        )
+                    else:
+                        await update.callback_query.edit_message_text(
+                            "⚠️ <b>Please join our channels first!</b>\n\n"
+                            "You need to join all channels to use this bot.\n"
+                            "Click the buttons below to join each channel:\n\n"
+                            "After joining all, click <b>'I've Joined All'</b> to continue.",
+                            parse_mode='HTML',
+                            reply_markup=InlineKeyboardMarkup(keyboard)
+                        )
+                    return False
             except Exception as e:
-                logger.error(f"Error checking channel {channel['username']}: {e}")
-                not_joined.append(channel)
-        
-        if not_joined:
-            keyboard = []
-            for channel in not_joined:
-                keyboard.append([InlineKeyboardButton(f"📢 Join {channel['username']}", url=channel['url'])])
-            keyboard.append([InlineKeyboardButton("✅ I've Joined All", callback_data="check_joined")])
-            
-            message_text = (
-                "⚠️ <b>Please join our channels first!</b>\n\n"
-                "You need to join all channels to use this bot.\n"
-                "Click the buttons below to join each channel:\n\n"
-                "After joining all, click <b>'I've Joined All'</b> to continue."
-            )
-            
-            if update.message:
-                await update.message.reply_text(
-                    message_text,
-                    parse_mode='HTML',
-                    reply_markup=InlineKeyboardMarkup(keyboard)
-                )
-            else:
-                await update.callback_query.edit_message_text(
-                    message_text,
-                    parse_mode='HTML',
-                    reply_markup=InlineKeyboardMarkup(keyboard)
-                )
-            return False
+                logger.error(f"Force join check error for {channel['username']}: {e}")
+                continue
         
         return True
 
@@ -236,7 +441,11 @@ class FreelanceBot:
             [InlineKeyboardButton("📋 Pending Reports", callback_data="admin_reports")],
             [InlineKeyboardButton("💰 Pending Unban Payments", callback_data="admin_payments")],
             [InlineKeyboardButton("👥 All Users", callback_data="admin_users")],
+            [InlineKeyboardButton("🔍 Search Users", callback_data="admin_search_users")],
             [InlineKeyboardButton("🔓 Unban User", callback_data="admin_unban")],
+            [InlineKeyboardButton("💾 Backup to GitHub", callback_data="admin_backup")],
+            [InlineKeyboardButton("📥 Restore from GitHub", callback_data="admin_restore")],
+            [InlineKeyboardButton("📤 Download DB File", callback_data="admin_download_db")],
             [InlineKeyboardButton("🏠 Back to Main Menu", callback_data="main_menu")]
         ]
         return InlineKeyboardMarkup(keyboard)
@@ -338,9 +547,9 @@ class FreelanceBot:
         keyboard.append([InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_panel")])
         return InlineKeyboardMarkup(keyboard)
 
-    def get_users_menu(self, users):
+    def get_users_menu(self, users, page=0, total_pages=1, search_term=""):
         keyboard = []
-        for user in users[:10]:
+        for user in users:
             status = "🚫" if user.is_banned else "✅"
             keyboard.append([
                 InlineKeyboardButton(
@@ -348,6 +557,18 @@ class FreelanceBot:
                     callback_data=f"view_user_{user.telegram_id}"
                 )
             ])
+        
+        # Pagination buttons
+        nav_buttons = []
+        if page > 0:
+            nav_buttons.append(InlineKeyboardButton("⬅️", callback_data=f"users_page_{page-1}_{search_term}"))
+        nav_buttons.append(InlineKeyboardButton(f"{page+1}/{total_pages}", callback_data="noop"))
+        if page < total_pages - 1:
+            nav_buttons.append(InlineKeyboardButton("➡️", callback_data=f"users_page_{page+1}_{search_term}"))
+        if nav_buttons:
+            keyboard.append(nav_buttons)
+        
+        keyboard.append([InlineKeyboardButton("🔍 Search Users", callback_data="admin_search_users")])
         keyboard.append([InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_panel")])
         return InlineKeyboardMarkup(keyboard)
 
@@ -372,7 +593,7 @@ class FreelanceBot:
         
         if db_user and db_user.is_banned:
             await update.message.reply_text(
-                "🚫 <b>You are BANNED from this bot!</b>\n\n"
+                f"🚫 <b>You are BANNED from this bot!</b>\n\n"
                 f"Reason: {db_user.ban_reason or 'Multiple scam reports'}\n"
                 f"This is your {db_user.ban_count + 1} ban.\n\n"
                 f"💰 <b>To unban, send {Config.UNBAN_FEE} Stars as a gift to:</b>\n"
@@ -423,11 +644,112 @@ class FreelanceBot:
             )
         session.close()
 
+    # ==================== ADMIN USER SEARCH ====================
+    async def admin_search_users(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        if user_id not in Config.ADMIN_IDS:
+            await update.callback_query.edit_message_text("❌ You are not an admin.")
+            return
+        
+        context.user_data['search_users'] = True
+        
+        await update.callback_query.edit_message_text(
+            "🔍 <b>Search Users</b>\n\n"
+            "Enter a name or username to search for:\n"
+            "(Partial matches are supported)\n\n"
+            "Examples:\n"
+            "• `John` - finds users with 'John' in name\n"
+            "• `@john_doe` - finds users with username\n"
+            "• `123456789` - finds by Telegram ID",
+            parse_mode='HTML',
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 Cancel", callback_data="admin_panel")]
+            ])
+        )
+
+    async def handle_user_search(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        if user_id not in Config.ADMIN_IDS:
+            await update.message.reply_text("❌ You are not an admin.")
+            return
+        
+        search_term = update.message.text.strip()
+        
+        session = Session()
+        
+        # Search by name, username, or telegram_id
+        query = session.query(User)
+        
+        if search_term.isdigit():
+            # Search by Telegram ID
+            query = query.filter(User.telegram_id == int(search_term))
+        else:
+            # Search by name or username (case-insensitive)
+            search_pattern = f"%{search_term}%"
+            query = query.filter(
+                (User.full_name.ilike(search_pattern)) | 
+                (User.username.ilike(search_pattern))
+            )
+        
+        # Limit results
+        results = query.limit(50).all()
+        session.close()
+        
+        if not results:
+            await update.message.reply_text(
+                f"❌ No users found matching '<b>{search_term}</b>'\n\n"
+                "Try a different search term.",
+                parse_mode='HTML',
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔍 Search Again", callback_data="admin_search_users")],
+                    [InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_panel")]
+                ])
+            )
+            return
+        
+        # Build results message
+        message = f"🔍 <b>Search Results</b>\n\n"
+        message += f"Found <b>{len(results)}</b> user(s) matching '<b>{search_term}</b>':\n\n"
+        
+        for user in results:
+            status = "🚫" if user.is_banned else "✅"
+            username = f"@{user.username}" if user.username else "No username"
+            message += f"{status} <b>{user.full_name}</b>\n"
+            message += f"   ID: <code>{user.telegram_id}</code>\n"
+            message += f"   Username: {username}\n"
+            message += f"   Role: {user.role.title()}\n"
+            message += f"   Reports: {user.report_count}\n\n"
+        
+        # Create user buttons for each result (max 10 to avoid message length issues)
+        keyboard = []
+        for user in results[:10]:
+            keyboard.append([
+                InlineKeyboardButton(
+                    f"{'🚫' if user.is_banned else '✅'} {user.full_name[:25]}", 
+                    callback_data=f"view_user_{user.telegram_id}"
+                )
+            ])
+        keyboard.append([InlineKeyboardButton("🔍 Search Again", callback_data="admin_search_users")])
+        keyboard.append([InlineKeyboardButton("👥 All Users", callback_data="admin_users")])
+        keyboard.append([InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_panel")])
+        
+        await update.message.reply_text(
+            message[:4000],  # Telegram message limit
+            parse_mode='HTML',
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+
     # ==================== TEXT HANDLER ====================
     async def text_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = update.message.text
         user_id = update.effective_user.id
         is_admin = user_id in Config.ADMIN_IDS
+        
+        # Handle user search
+        if context.user_data.get('search_users'):
+            await self.handle_user_search(update, context)
+            context.user_data['search_users'] = False
+            return
         
         # Handle job posting
         if context.user_data.get('posting_job'):
@@ -561,6 +883,9 @@ class FreelanceBot:
             ])
         )
         
+        # Trigger backup after important change
+        async_backup(f"new_job_{job.id}")
+        
         session.close()
         context.user_data.clear()
 
@@ -656,6 +981,9 @@ class FreelanceBot:
                         ),
                         parse_mode='HTML'
                     )
+                
+                # Trigger backup after ban
+                async_backup(f"ban_{reported_id}")
         
         session.commit()
         session.close()
@@ -719,6 +1047,7 @@ class FreelanceBot:
             ])
         )
         
+        async_backup(f"unban_payment_{user_id}")
         session.close()
         context.user_data.clear()
 
@@ -955,8 +1284,381 @@ class FreelanceBot:
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_panel")]])
         )
         
+        async_backup(f"admin_unban_{target_id}")
         session.close()
         context.user_data.clear()
+
+    # ==================== ADMIN BACKUP ====================
+    async def admin_backup(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        if user_id not in Config.ADMIN_IDS:
+            await update.callback_query.edit_message_text("❌ You are not an admin.")
+            return
+        
+        await update.callback_query.edit_message_text("🔄 Backing up database to GitHub...")
+        
+        if not Config.GITHUB_ENABLED:
+            await update.callback_query.edit_message_text(
+                "❌ GitHub backup is not configured.\n\n"
+                "Set these environment variables:\n"
+                "- GITHUB_TOKEN\n"
+                "- GITHUB_REPO_OWNER\n"
+                "- GITHUB_REPO_NAME",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]])
+            )
+            return
+        
+        success = github_backup_db(reason=f"manual_admin_{user_id}", force=True)
+        if success:
+            await update.callback_query.edit_message_text(
+                "✅ Database backed up to GitHub successfully!",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]])
+            )
+        else:
+            await update.callback_query.edit_message_text(
+                "❌ Backup failed. Check logs for details.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]])
+            )
+
+    # ==================== ADMIN RESTORE ====================
+    async def admin_restore(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        if user_id not in Config.ADMIN_IDS:
+            await update.callback_query.edit_message_text("❌ You are not an admin.")
+            return
+        
+        await update.callback_query.edit_message_text(
+            "⚠️ <b>RESTORE DATABASE FROM GITHUB</b>\n\n"
+            "This will REPLACE the current database with the backup from GitHub.\n"
+            "All current data will be lost!\n\n"
+            "Are you sure?",
+            parse_mode='HTML',
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Yes, Restore", callback_data="confirm_restore")],
+                [InlineKeyboardButton("❌ Cancel", callback_data="admin_panel")]
+            ])
+        )
+
+    async def confirm_restore(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        if user_id not in Config.ADMIN_IDS:
+            await update.callback_query.edit_message_text("❌ You are not an admin.")
+            return
+        
+        await update.callback_query.edit_message_text("🔄 Restoring database from GitHub...")
+        
+        if not Config.GITHUB_ENABLED:
+            await update.callback_query.edit_message_text(
+                "❌ GitHub backup is not configured.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]])
+            )
+            return
+        
+        # Close all sessions before restore
+        Session.close_all()
+        
+        success = github_restore_db()
+        if success:
+            await update.callback_query.edit_message_text(
+                "✅ Database restored from GitHub successfully!\n\n"
+                "The bot will restart to apply changes.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔄 Restart Bot", callback_data="restart_bot")],
+                    [InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]
+                ])
+            )
+        else:
+            await update.callback_query.edit_message_text(
+                "❌ Restore failed. Check logs for details.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]])
+            )
+
+    # ==================== ADMIN DOWNLOAD DB ====================
+    async def admin_download_db(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        if user_id not in Config.ADMIN_IDS:
+            await update.callback_query.edit_message_text("❌ You are not an admin.")
+            return
+        
+        if not DATABASE_FILE.exists():
+            await update.callback_query.edit_message_text(
+                "❌ Database file not found.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]])
+            )
+            return
+        
+        await update.callback_query.edit_message_text("📤 Preparing database file for download...")
+        
+        # Send the database file
+        try:
+            with open(DATABASE_FILE, 'rb') as f:
+                await context.bot.send_document(
+                    chat_id=user_id,
+                    document=f,
+                    filename=f"freelance_bot_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db",
+                    caption=f"💾 Database backup - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                            f"Size: {DATABASE_FILE.stat().st_size / 1024:.1f} KB"
+                )
+            
+            await update.callback_query.edit_message_text(
+                "✅ Database file sent successfully!",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]])
+            )
+        except Exception as e:
+            await update.callback_query.edit_message_text(
+                f"❌ Failed to send database file: {e}",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]])
+            )
+
+    # ==================== ADMIN STATS ====================
+    async def admin_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        if user_id not in Config.ADMIN_IDS:
+            await update.callback_query.edit_message_text("❌ You are not an admin.")
+            return
+        
+        session = Session()
+        
+        total_users = session.query(User).count()
+        banned_users = session.query(User).filter_by(is_banned=True).count()
+        total_reports = session.query(Report).count()
+        pending_reports = session.query(Report).filter_by(status='pending').count()
+        total_jobs = session.query(Job).count()
+        active_jobs = session.query(Job).filter_by(is_active=True).count()
+        total_ratings = session.query(Rating).count()
+        total_payments = session.query(UnbanPayment).count()
+        pending_payments = session.query(UnbanPayment).filter_by(status='pending').count()
+        completed_payments = session.query(UnbanPayment).filter_by(status='completed').count()
+        
+        session.close()
+        
+        await update.callback_query.edit_message_text(
+            f"📊 <b>Statistics</b>\n\n"
+            f"👤 Users: {total_users} (Banned: {banned_users})\n"
+            f"📋 Reports: {total_reports} (Pending: {pending_reports})\n"
+            f"💼 Jobs: {total_jobs} (Active: {active_jobs})\n"
+            f"⭐ Ratings: {total_ratings}\n"
+            f"💰 Payments: {total_payments} (Pending: {pending_payments}, Completed: {completed_payments})",
+            parse_mode='HTML',
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_panel")]])
+        )
+
+    # ==================== ADMIN REPORTS ====================
+    async def admin_reports(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        if user_id not in Config.ADMIN_IDS:
+            await update.callback_query.edit_message_text("❌ You are not an admin.")
+            return
+        
+        session = Session()
+        pending_reports = session.query(Report).filter_by(status='pending').all()
+        
+        if not pending_reports:
+            await update.callback_query.edit_message_text(
+                "✅ No pending reports!",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_panel")]])
+            )
+            session.close()
+            return
+        
+        reports_with_users = []
+        for report in pending_reports[:10]:
+            user = session.query(User).filter_by(telegram_id=report.reported_id).first()
+            reports_with_users.append((user, report))
+        
+        await update.callback_query.edit_message_text(
+            f"📋 <b>Pending Reports ({len(pending_reports)})</b>\n\n"
+            "Click a report to view details:",
+            parse_mode='HTML',
+            reply_markup=self.get_reports_menu(reports_with_users)
+        )
+        session.close()
+
+    # ==================== ADMIN PAYMENTS ====================
+    async def admin_payments(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        if user_id not in Config.ADMIN_IDS:
+            await update.callback_query.edit_message_text("❌ You are not an admin.")
+            return
+        
+        session = Session()
+        pending_payments = session.query(UnbanPayment).filter_by(status='pending').all()
+        
+        if not pending_payments:
+            await update.callback_query.edit_message_text(
+                "✅ No pending payments!",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_panel")]])
+            )
+            session.close()
+            return
+        
+        payments_with_users = []
+        for payment in pending_payments[:10]:
+            user = session.query(User).filter_by(telegram_id=payment.user_id).first()
+            payments_with_users.append((user, payment))
+        
+        await update.callback_query.edit_message_text(
+            f"💰 <b>Pending Unban Payments ({len(pending_payments)})</b>\n\n"
+            "Click a payment to view:",
+            parse_mode='HTML',
+            reply_markup=self.get_payments_menu(payments_with_users)
+        )
+        session.close()
+
+    # ==================== ADMIN USERS ====================
+    async def admin_users(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        if user_id not in Config.ADMIN_IDS:
+            await update.callback_query.edit_message_text("❌ You are not an admin.")
+            return
+        
+        session = Session()
+        total_users = session.query(User).count()
+        page = context.user_data.get('users_page', 0)
+        per_page = 10
+        
+        users = session.query(User).order_by(User.created_at.desc()).offset(page * per_page).limit(per_page).all()
+        total_pages = (total_users + per_page - 1) // per_page
+        
+        session.close()
+        
+        if not users:
+            await update.callback_query.edit_message_text(
+                "👥 No users found.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_panel")]])
+            )
+            return
+        
+        await update.callback_query.edit_message_text(
+            f"👥 <b>Users</b> (Page {page+1}/{total_pages})\n\n"
+            "Click a user to manage:",
+            parse_mode='HTML',
+            reply_markup=self.get_users_menu(users, page, total_pages, "")
+        )
+
+    # ==================== VIEW USER ====================
+    async def view_user(self, update: Update, context: ContextTypes.DEFAULT_TYPE, target_id):
+        user_id = update.effective_user.id
+        if user_id not in Config.ADMIN_IDS:
+            await update.callback_query.edit_message_text("❌ You are not an admin.")
+            return
+        
+        session = Session()
+        user = session.query(User).filter_by(telegram_id=target_id).first()
+        
+        if not user:
+            await update.callback_query.edit_message_text("❌ User not found.")
+            session.close()
+            return
+        
+        avg_rating = self.get_average_rating(target_id)
+        
+        await update.callback_query.edit_message_text(
+            f"👤 <b>User Details</b>\n\n"
+            f"Name: {user.full_name}\n"
+            f"Username: @{user.username or 'Not set'}\n"
+            f"Role: {user.role.title()}\n"
+            f"Currency: {user.currency}\n"
+            f"⭐ Rating: {avg_rating:.1f}/5.0\n"
+            f"📊 Reports: {user.report_count}\n"
+            f"🚫 Banned: {'Yes' if user.is_banned else 'No'}\n"
+            f"📅 Joined: {user.created_at.strftime('%Y-%m-%d')}",
+            parse_mode='HTML',
+            reply_markup=self.get_user_actions_menu(target_id)
+        )
+        session.close()
+
+    # ==================== UNBAN USER ====================
+    async def unban_user(self, update: Update, context: ContextTypes.DEFAULT_TYPE, target_id):
+        user_id = update.effective_user.id
+        if user_id not in Config.ADMIN_IDS:
+            await update.callback_query.edit_message_text("❌ You are not an admin.")
+            return
+        
+        session = Session()
+        user = session.query(User).filter_by(telegram_id=target_id).first()
+        
+        if user and user.is_banned:
+            user.is_banned = False
+            user.ban_reason = None
+            user.ban_count += 1
+            user.report_count = 0
+            session.commit()
+            
+            try:
+                await context.bot.send_message(
+                    chat_id=target_id,
+                    text=(
+                        f"✅ <b>You have been unbanned by an admin!</b>\n\n"
+                        f"Welcome back! Please follow the rules."
+                    ),
+                    parse_mode='HTML',
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]])
+                )
+            except:
+                pass
+            
+            await update.callback_query.edit_message_text(
+                f"✅ User {user.full_name} has been unbanned!",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Users", callback_data="admin_users")]])
+            )
+            async_backup(f"unban_{target_id}")
+        else:
+            await update.callback_query.edit_message_text("❌ User is not banned or not found.")
+        session.close()
+
+    # ==================== BAN USER ====================
+    async def ban_user(self, update: Update, context: ContextTypes.DEFAULT_TYPE, target_id):
+        user_id = update.effective_user.id
+        if user_id not in Config.ADMIN_IDS:
+            await update.callback_query.edit_message_text("❌ You are not an admin.")
+            return
+        
+        session = Session()
+        user = session.query(User).filter_by(telegram_id=target_id).first()
+        
+        if user and not user.is_banned:
+            user.is_banned = True
+            user.ban_reason = "Banned by admin"
+            session.commit()
+            
+            try:
+                await context.bot.send_message(
+                    chat_id=target_id,
+                    text=(
+                        f"🚫 <b>You have been banned by an admin!</b>\n\n"
+                        f"To unban, contact @{Config.RECEIVER_USERNAME}"
+                    ),
+                    parse_mode='HTML'
+                )
+            except:
+                pass
+            
+            await update.callback_query.edit_message_text(
+                f"✅ User {user.full_name} has been banned!",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Users", callback_data="admin_users")]])
+            )
+            async_backup(f"ban_admin_{target_id}")
+        else:
+            await update.callback_query.edit_message_text("❌ User is already banned or not found.")
+        session.close()
+
+    # ==================== ADMIN UNBAN (by ID input) ====================
+    async def admin_unban_by_id_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        if user_id not in Config.ADMIN_IDS:
+            await update.callback_query.edit_message_text("❌ You are not an admin.")
+            return
+        
+        context.user_data['admin_unban'] = True
+        
+        await update.callback_query.edit_message_text(
+            "🔓 <b>Unban User</b>\n\n"
+            "Please enter the <b>Telegram ID</b> of the user you want to unban:\n\n"
+            "You can find the ID in user profiles or reports.",
+            parse_mode='HTML',
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Cancel", callback_data="admin_panel")]])
+        )
 
     # ==================== GET AVERAGE RATING ====================
     def get_average_rating(self, user_id):
@@ -1200,7 +1902,7 @@ class FreelanceBot:
             )
             return
         
-        # ===== CONTACT METHOD SELECTION (during job posting) =====
+        # ===== CONTACT METHOD SELECTION =====
         elif data.startswith('contact_method_'):
             method = data.replace('contact_method_', '')
             context.user_data['contact_method'] = method
@@ -1214,7 +1916,7 @@ class FreelanceBot:
             )
             return
         
-        # ===== CONTACT CLIENT (view job contact info) =====
+        # ===== CONTACT CLIENT =====
         elif data.startswith('contact_job_'):
             job_id = int(data.replace('contact_job_', ''))
             await self.contact_client(job_id, update)
@@ -1405,6 +2107,7 @@ class FreelanceBot:
                 f"✅ Job '{job.title}' has been deleted.",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📂 My Jobs", callback_data="my_jobs")]])
             )
+            async_backup(f"delete_job_{job_id}")
             return
         
         # ===== UNBAN PAYMENT =====
@@ -1451,52 +2154,29 @@ class FreelanceBot:
             )
             return
         
-        # ===== ADMIN UNBAN =====
-        elif data == "admin_unban":
-            if not is_admin:
-                await query.edit_message_text("❌ You are not an admin.")
-                return
-            
-            context.user_data['admin_unban'] = True
-            
-            await query.edit_message_text(
-                "🔓 <b>Unban User</b>\n\n"
-                "Please enter the <b>Telegram ID</b> of the user you want to unban:\n\n"
-                "You can find the ID in user profiles or reports.",
-                parse_mode='HTML',
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Cancel", callback_data="admin_panel")]])
-            )
+        # ===== ADMIN BACKUP =====
+        elif data == "admin_backup":
+            await self.admin_backup(update, context)
+            return
+        
+        # ===== ADMIN RESTORE =====
+        elif data == "admin_restore":
+            await self.admin_restore(update, context)
+            return
+        
+        # ===== CONFIRM RESTORE =====
+        elif data == "confirm_restore":
+            await self.confirm_restore(update, context)
+            return
+        
+        # ===== ADMIN DOWNLOAD DB =====
+        elif data == "admin_download_db":
+            await self.admin_download_db(update, context)
             return
         
         # ===== ADMIN STATS =====
         elif data == "admin_stats":
-            if not is_admin:
-                await query.edit_message_text("❌ You are not an admin.")
-                return
-            
-            session = Session()
-            total_users = session.query(User).count()
-            banned_users = session.query(User).filter_by(is_banned=True).count()
-            total_reports = session.query(Report).count()
-            pending_reports = session.query(Report).filter_by(status='pending').count()
-            total_jobs = session.query(Job).count()
-            active_jobs = session.query(Job).filter_by(is_active=True).count()
-            total_ratings = session.query(Rating).count()
-            total_payments = session.query(UnbanPayment).count()
-            pending_payments = session.query(UnbanPayment).filter_by(status='pending').count()
-            completed_payments = session.query(UnbanPayment).filter_by(status='completed').count()
-            session.close()
-            
-            await query.edit_message_text(
-                f"📊 <b>Statistics</b>\n\n"
-                f"👤 Users: {total_users} (Banned: {banned_users})\n"
-                f"📋 Reports: {total_reports} (Pending: {pending_reports})\n"
-                f"💼 Jobs: {total_jobs} (Active: {active_jobs})\n"
-                f"⭐ Ratings: {total_ratings}\n"
-                f"💰 Payments: {total_payments} (Pending: {pending_payments}, Completed: {completed_payments})",
-                parse_mode='HTML',
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_panel")]])
-            )
+            await self.admin_stats(update, context)
             return
         
         # ===== ADMIN BROADCAST =====
@@ -1504,39 +2184,43 @@ class FreelanceBot:
             if not is_admin:
                 await query.edit_message_text("❌ You are not an admin.")
                 return
-            
             await self.broadcast_start_callback(update, context)
             return
         
         # ===== ADMIN REPORTS =====
         elif data == "admin_reports":
-            if not is_admin:
-                await query.edit_message_text("❌ You are not an admin.")
-                return
-            
-            session = Session()
-            pending_reports = session.query(Report).filter_by(status='pending').all()
-            
-            if not pending_reports:
-                await query.edit_message_text(
-                    "✅ No pending reports!",
-                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_panel")]])
-                )
-                session.close()
-                return
-            
-            reports_with_users = []
-            for report in pending_reports[:10]:
-                user = session.query(User).filter_by(telegram_id=report.reported_id).first()
-                reports_with_users.append((user, report))
-            
+            await self.admin_reports(update, context)
+            return
+        
+        # ===== ADMIN PAYMENTS =====
+        elif data == "admin_payments":
+            await self.admin_payments(update, context)
+            return
+        
+        # ===== ADMIN USERS =====
+        elif data == "admin_users":
+            await self.admin_users(update, context)
+            return
+        
+        # ===== ADMIN SEARCH USERS =====
+        elif data == "admin_search_users":
+            await self.admin_search_users(update, context)
+            return
+        
+        # ===== ADMIN UNBAN (by ID) =====
+        elif data == "admin_unban":
+            await self.admin_unban_by_id_start(update, context)
+            return
+        
+        # ===== RESTART BOT =====
+        elif data == "restart_bot":
             await query.edit_message_text(
-                f"📋 <b>Pending Reports ({len(pending_reports)})</b>\n\n"
-                "Click a report to view details:",
-                parse_mode='HTML',
-                reply_markup=self.get_reports_menu(reports_with_users)
+                "🔄 Restarting bot...\n\n"
+                "The bot will restart automatically.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]])
             )
-            session.close()
+            # Trigger a restart (in production, you'd use a process manager)
+            os._exit(0)
             return
         
         # ===== VIEW REPORT =====
@@ -1593,6 +2277,7 @@ class FreelanceBot:
                     f"✅ Report #{report_id} resolved!",
                     reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Reports", callback_data="admin_reports")]])
                 )
+                async_backup(f"resolve_report_{report_id}")
             session.close()
             return
         
@@ -1615,37 +2300,7 @@ class FreelanceBot:
                     f"✅ Report #{report_id} dismissed!",
                     reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Reports", callback_data="admin_reports")]])
                 )
-            session.close()
-            return
-        
-        # ===== ADMIN PAYMENTS =====
-        elif data == "admin_payments":
-            if not is_admin:
-                await query.edit_message_text("❌ You are not an admin.")
-                return
-            
-            session = Session()
-            pending_payments = session.query(UnbanPayment).filter_by(status='pending').all()
-            
-            if not pending_payments:
-                await query.edit_message_text(
-                    "✅ No pending payments!",
-                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_panel")]])
-                )
-                session.close()
-                return
-            
-            payments_with_users = []
-            for payment in pending_payments[:10]:
-                user = session.query(User).filter_by(telegram_id=payment.user_id).first()
-                payments_with_users.append((user, payment))
-            
-            await query.edit_message_text(
-                f"💰 <b>Pending Unban Payments ({len(pending_payments)})</b>\n\n"
-                "Click a payment to view:",
-                parse_mode='HTML',
-                reply_markup=self.get_payments_menu(payments_with_users)
-            )
+                async_backup(f"dismiss_report_{report_id}")
             session.close()
             return
         
@@ -1725,143 +2380,29 @@ class FreelanceBot:
                     f"✅ Payment confirmed! User unbanned.",
                     reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Payments", callback_data="admin_payments")]])
                 )
+                async_backup(f"confirm_payment_{payment_id}")
             else:
                 await query.edit_message_text("❌ User is not banned or not found.")
             
             session.close()
-            return
-        
-        # ===== ADMIN USERS =====
-        elif data == "admin_users":
-            if not is_admin:
-                await query.edit_message_text("❌ You are not an admin.")
-                return
-            
-            session = Session()
-            users = session.query(User).order_by(User.created_at.desc()).limit(20).all()
-            session.close()
-            
-            if not users:
-                await query.edit_message_text(
-                    "No users found.",
-                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_panel")]])
-                )
-                return
-            
-            await query.edit_message_text(
-                "👥 <b>Recent Users</b>\n\n"
-                "Click a user to manage:",
-                parse_mode='HTML',
-                reply_markup=self.get_users_menu(users)
-            )
             return
         
         # ===== VIEW USER =====
         elif data.startswith('view_user_'):
-            if not is_admin:
-                await query.edit_message_text("❌ You are not an admin.")
-                return
-            
             target_id = int(data.replace('view_user_', ''))
-            session = Session()
-            user = session.query(User).filter_by(telegram_id=target_id).first()
-            
-            if not user:
-                await query.edit_message_text("❌ User not found.")
-                session.close()
-                return
-            
-            avg_rating = self.get_average_rating(target_id)
-            
-            await query.edit_message_text(
-                f"👤 <b>User Details</b>\n\n"
-                f"Name: {user.full_name}\n"
-                f"Username: @{user.username or 'Not set'}\n"
-                f"Role: {user.role.title()}\n"
-                f"Currency: {user.currency}\n"
-                f"⭐ Rating: {avg_rating:.1f}/5.0\n"
-                f"📊 Reports: {user.report_count}\n"
-                f"🚫 Banned: {'Yes' if user.is_banned else 'No'}\n"
-                f"📅 Joined: {user.created_at.strftime('%Y-%m-%d')}",
-                parse_mode='HTML',
-                reply_markup=self.get_user_actions_menu(target_id)
-            )
-            session.close()
+            await self.view_user(update, context, target_id)
             return
         
         # ===== UNBAN USER =====
         elif data.startswith('unban_user_'):
-            if not is_admin:
-                await query.edit_message_text("❌ You are not an admin.")
-                return
-            
             target_id = int(data.replace('unban_user_', ''))
-            session = Session()
-            user = session.query(User).filter_by(telegram_id=target_id).first()
-            
-            if user and user.is_banned:
-                user.is_banned = False
-                user.ban_reason = None
-                user.ban_count += 1
-                user.report_count = 0
-                session.commit()
-                
-                try:
-                    await context.bot.send_message(
-                        chat_id=target_id,
-                        text=(
-                            f"✅ <b>You have been unbanned by an admin!</b>\n\n"
-                            f"Welcome back! Please follow the rules."
-                        ),
-                        parse_mode='HTML',
-                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]])
-                    )
-                except:
-                    pass
-                
-                await query.edit_message_text(
-                    f"✅ User {user.full_name} has been unbanned!",
-                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Users", callback_data="admin_users")]])
-                )
-            else:
-                await query.edit_message_text("❌ User is not banned or not found.")
-            session.close()
+            await self.unban_user(update, context, target_id)
             return
         
         # ===== BAN USER =====
         elif data.startswith('ban_user_'):
-            if not is_admin:
-                await query.edit_message_text("❌ You are not an admin.")
-                return
-            
             target_id = int(data.replace('ban_user_', ''))
-            session = Session()
-            user = session.query(User).filter_by(telegram_id=target_id).first()
-            
-            if user and not user.is_banned:
-                user.is_banned = True
-                user.ban_reason = "Banned by admin"
-                session.commit()
-                
-                try:
-                    await context.bot.send_message(
-                        chat_id=target_id,
-                        text=(
-                            f"🚫 <b>You have been banned by an admin!</b>\n\n"
-                            f"To unban, contact @{Config.RECEIVER_USERNAME}"
-                        ),
-                        parse_mode='HTML'
-                    )
-                except:
-                    pass
-                
-                await query.edit_message_text(
-                    f"✅ User {user.full_name} has been banned!",
-                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Users", callback_data="admin_users")]])
-                )
-            else:
-                await query.edit_message_text("❌ User is already banned or not found.")
-            session.close()
+            await self.ban_user(update, context, target_id)
             return
         
         # ===== CHECK JOINED =====
@@ -1872,6 +2413,11 @@ class FreelanceBot:
                     "✅ Thank you for joining!",
                     reply_markup=self.get_main_menu(is_admin)
                 )
+            return
+        
+        # ===== NOOP (for pagination placeholder) =====
+        elif data == "noop":
+            await query.answer()
             return
 
     # ==================== RUN ====================
