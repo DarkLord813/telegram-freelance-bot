@@ -18,12 +18,13 @@ load_dotenv()
 
 class Config:
     BOT_TOKEN = os.getenv('BOT_TOKEN')
-    DATABASE_URL = os.getenv('DATABASE_URL', 'sqlite:///freelance_bot.db')
     ADMIN_IDS = [int(id.strip()) for id in os.getenv('ADMIN_IDS', '').split(',') if id.strip()]
     REPORT_THRESHOLD = 5
     UNBAN_FEE = 50
-    RECEIVER_USERNAME = os.getenv('RECEIVER_USERNAME', 'YourMainAccount')
-    RECEIVER_TELEGRAM_ID = int(os.getenv('RECEIVER_TELEGRAM_ID', '123456789'))
+    
+    # YOUR Telegram account details
+    RECEIVER_USERNAME = 'rexoronsaye'
+    RECEIVER_TELEGRAM_ID = 7713987088
     
     FORCE_JOIN_CHANNELS = [
         'https://t.me/PulseProfit012',
@@ -51,8 +52,9 @@ class Config:
     }
     DEFAULT_CURRENCY = 'USD'
 
+# SQLite database (no DATABASE_URL needed)
 Base = declarative_base()
-engine = create_engine(Config.DATABASE_URL)
+engine = create_engine('sqlite:///freelance_bot.db')
 Session = sessionmaker(bind=engine)
 
 class User(Base):
@@ -71,7 +73,6 @@ class User(Base):
     report_count = Column(Integer, default=0)
     warning_count = Column(Integer, default=0)
     created_at = Column(DateTime, default=datetime.utcnow)
-    is_admin = Column(Boolean, default=False)
 
 class Job(Base):
     __tablename__ = 'jobs'
@@ -138,8 +139,10 @@ class BroadcastMessage(Base):
     failed_count = Column(Integer, default=0)
     created_at = Column(DateTime, default=datetime.utcnow)
 
+# Create tables
 Base.metadata.create_all(engine)
 
+# Conversation states
 TITLE, DESCRIPTION, CATEGORY, CURRENCY, BUDGET_MIN, BUDGET_MAX, CONTACT_METHOD, CONTACT_INFO = range(8)
 RATING_SCORE, RATING_REVIEW = range(2)
 REPORT_REASON = range(1)
@@ -169,8 +172,43 @@ class FreelanceBot:
         self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.text_handler))
         self.application.add_handler(MessageHandler(filters.PHOTO, self.photo_handler))
 
+    # ==================== CHECK FORCE JOIN ====================
+    async def check_force_join(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        
+        for channel in Config.CHANNEL_USERNAMES:
+            try:
+                member = await context.bot.get_chat_member(f"@{channel}", user_id)
+                if member.status not in ['member', 'administrator', 'creator']:
+                    keyboard = []
+                    for ch in Config.FORCE_JOIN_CHANNELS:
+                        keyboard.append([InlineKeyboardButton("📢 Join Channel", url=ch)])
+                    keyboard.append([InlineKeyboardButton("✅ I've Joined", callback_data="check_joined")])
+                    
+                    if update.message:
+                        await update.message.reply_text(
+                            "⚠️ <b>Please join our channels first!</b>\n\n"
+                            "You need to join all channels to use this bot.\n"
+                            "Click the buttons below to join:",
+                            parse_mode='HTML',
+                            reply_markup=InlineKeyboardMarkup(keyboard)
+                        )
+                    else:
+                        await update.callback_query.edit_message_text(
+                            "⚠️ <b>Please join our channels first!</b>\n\n"
+                            "You need to join all channels to use this bot.\n"
+                            "Click the buttons below to join:",
+                            parse_mode='HTML',
+                            reply_markup=InlineKeyboardMarkup(keyboard)
+                        )
+                    return False
+            except:
+                pass
+        
+        return True
+
     # ==================== MAIN MENU ====================
-    def get_main_menu(self, is_admin=False):
+    def get_main_menu(self):
         keyboard = [
             [InlineKeyboardButton("📋 Browse Jobs", callback_data="browse_jobs")],
             [InlineKeyboardButton("💰 Post a Job", callback_data="post_job")],
@@ -179,8 +217,6 @@ class FreelanceBot:
             [InlineKeyboardButton("⚙️ Settings", callback_data="settings")],
             [InlineKeyboardButton("❓ Help", callback_data="help")]
         ]
-        if is_admin:
-            keyboard.append([InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")])
         return InlineKeyboardMarkup(keyboard)
 
     # ==================== ADMIN MENU ====================
@@ -191,56 +227,8 @@ class FreelanceBot:
             [InlineKeyboardButton("📋 Pending Reports", callback_data="admin_reports")],
             [InlineKeyboardButton("💰 Pending Unban Payments", callback_data="admin_payments")],
             [InlineKeyboardButton("👥 All Users", callback_data="admin_users")],
+            [InlineKeyboardButton("🔓 Unban User", callback_data="admin_unban")],
             [InlineKeyboardButton("🏠 Back to Main Menu", callback_data="main_menu")]
-        ]
-        return InlineKeyboardMarkup(keyboard)
-
-    def get_reports_menu(self, reports):
-        keyboard = []
-        for report in reports[:10]:
-            user = report[0]
-            report_obj = report[1]
-            keyboard.append([
-                InlineKeyboardButton(
-                    f"📋 Report #{report_obj.id} - {user.full_name[:20]}", 
-                    callback_data=f"view_report_{report_obj.id}"
-                )
-            ])
-        keyboard.append([InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_panel")])
-        return InlineKeyboardMarkup(keyboard)
-
-    def get_payments_menu(self, payments):
-        keyboard = []
-        for payment in payments[:10]:
-            user = payment[0]
-            keyboard.append([
-                InlineKeyboardButton(
-                    f"💰 {user.full_name[:20]} - {payment.amount} Stars", 
-                    callback_data=f"view_payment_{payment.id}"
-                )
-            ])
-        keyboard.append([InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_panel")])
-        return InlineKeyboardMarkup(keyboard)
-
-    def get_users_menu(self, users):
-        keyboard = []
-        for user in users[:10]:
-            status = "🚫" if user.is_banned else "✅"
-            keyboard.append([
-                InlineKeyboardButton(
-                    f"{status} {user.full_name[:20]} (@{user.username or 'No username'})", 
-                    callback_data=f"view_user_{user.telegram_id}"
-                )
-            ])
-        keyboard.append([InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_panel")])
-        return InlineKeyboardMarkup(keyboard)
-
-    def get_user_actions_menu(self, user_id):
-        keyboard = [
-            [InlineKeyboardButton("🔓 Unban User", callback_data=f"unban_user_{user_id}")],
-            [InlineKeyboardButton("🚫 Ban User", callback_data=f"ban_user_{user_id}")],
-            [InlineKeyboardButton("👑 Make Admin", callback_data=f"make_admin_{user_id}")],
-            [InlineKeyboardButton("🔙 Back to Users", callback_data="admin_users")]
         ]
         return InlineKeyboardMarkup(keyboard)
 
@@ -314,45 +302,59 @@ class FreelanceBot:
         ]
         return InlineKeyboardMarkup(keyboard)
 
-    # ==================== FORCE JOIN ====================
-    async def check_force_join(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user_id = update.effective_user.id
-        
-        for channel in Config.CHANNEL_USERNAMES:
-            try:
-                member = await context.bot.get_chat_member(f"@{channel}", user_id)
-                if member.status not in ['member', 'administrator', 'creator']:
-                    keyboard = []
-                    for ch in Config.FORCE_JOIN_CHANNELS:
-                        keyboard.append([InlineKeyboardButton(f"📢 Join Channel", url=ch)])
-                    keyboard.append([InlineKeyboardButton("✅ I've Joined", callback_data="check_joined")])
-                    
-                    if update.message:
-                        await update.message.reply_text(
-                            "⚠️ **Please join our channels first!**\n\n"
-                            "You need to join all channels to use this bot.\n"
-                            "Click the buttons below to join:",
-                            parse_mode='Markdown',
-                            reply_markup=InlineKeyboardMarkup(keyboard)
-                        )
-                    else:
-                        await update.callback_query.edit_message_text(
-                            "⚠️ **Please join our channels first!**\n\n"
-                            "You need to join all channels to use this bot.\n"
-                            "Click the buttons below to join:",
-                            parse_mode='Markdown',
-                            reply_markup=InlineKeyboardMarkup(keyboard)
-                        )
-                    return False
-            except:
-                pass
-        
-        return True
+    def get_reports_menu(self, reports):
+        keyboard = []
+        for report in reports[:10]:
+            user = report[0]
+            report_obj = report[1]
+            keyboard.append([
+                InlineKeyboardButton(
+                    f"📋 Report #{report_obj.id} - {user.full_name[:20]}", 
+                    callback_data=f"view_report_{report_obj.id}"
+                )
+            ])
+        keyboard.append([InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_panel")])
+        return InlineKeyboardMarkup(keyboard)
+
+    def get_payments_menu(self, payments):
+        keyboard = []
+        for payment in payments[:10]:
+            user = payment[0]
+            keyboard.append([
+                InlineKeyboardButton(
+                    f"💰 {user.full_name[:20]} - {payment.amount} Stars", 
+                    callback_data=f"view_payment_{payment.id}"
+                )
+            ])
+        keyboard.append([InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_panel")])
+        return InlineKeyboardMarkup(keyboard)
+
+    def get_users_menu(self, users):
+        keyboard = []
+        for user in users[:10]:
+            status = "🚫" if user.is_banned else "✅"
+            keyboard.append([
+                InlineKeyboardButton(
+                    f"{status} {user.full_name[:20]} (@{user.username or 'No username'})", 
+                    callback_data=f"view_user_{user.telegram_id}"
+                )
+            ])
+        keyboard.append([InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_panel")])
+        return InlineKeyboardMarkup(keyboard)
+
+    def get_user_actions_menu(self, user_id):
+        keyboard = [
+            [InlineKeyboardButton("🔓 Unban User", callback_data=f"unban_user_{user_id}")],
+            [InlineKeyboardButton("🚫 Ban User", callback_data=f"ban_user_{user_id}")],
+            [InlineKeyboardButton("🔙 Back to Users", callback_data="admin_users")]
+        ]
+        return InlineKeyboardMarkup(keyboard)
 
     # ==================== START ====================
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = update.effective_user
         
+        # Check force join first
         if not await self.check_force_join(update, context):
             return
         
@@ -365,17 +367,17 @@ class FreelanceBot:
         
         if db_user and db_user.is_banned:
             await update.message.reply_text(
-                f"🚫 **You are BANNED from this bot!**\n\n"
+                "🚫 <b>You are BANNED from this bot!</b>\n\n"
                 f"Reason: {db_user.ban_reason or 'Multiple scam reports'}\n"
                 f"This is your {db_user.ban_count + 1} ban.\n\n"
-                f"💰 **To unban, send {Config.UNBAN_FEE} Stars as a gift to:**\n"
-                f"**@{Config.RECEIVER_USERNAME}**\n\n"
-                f"📝 **Instructions:**\n"
-                f"1. Click the button below to send Stars\n"
+                f"💰 <b>To unban, send {Config.UNBAN_FEE} Stars as a gift to:</b>\n"
+                f"<b>@{Config.RECEIVER_USERNAME}</b>\n\n"
+                "<b>Instructions:</b>\n"
+                "1. Click the button below to send Stars\n"
                 f"2. Send exactly {Config.UNBAN_FEE} Stars\n"
-                f"3. Click 'I've Sent the Stars' button after sending\n\n"
-                f"⚠️ You'll be unbanned after admin confirmation.",
-                parse_mode='Markdown',
+                "3. Click 'I've Sent the Stars' button after sending\n\n"
+                "⚠️ You'll be unbanned after admin confirmation.",
+                parse_mode='HTML',
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton(f"⭐ Send {Config.UNBAN_FEE} Stars", url=f"https://t.me/{Config.RECEIVER_USERNAME}")],
                     [InlineKeyboardButton("✅ I've Sent the Stars", callback_data="pay_unban")],
@@ -393,23 +395,49 @@ class FreelanceBot:
             )
             session.add(db_user)
             session.commit()
-            await update.message.reply_text(
-                f"👋 Welcome to FreelanceHub, {user.full_name}!\n\n"
-                f"Use the buttons below to navigate:",
-                reply_markup=self.get_main_menu(is_admin)
+            
+            welcome_text = (
+                f"👋 <b>Welcome to FreelanceHub, {user.full_name}!</b>\n\n"
+                "Use the buttons below to navigate:"
             )
+            
+            if is_admin:
+                await update.message.reply_text(
+                    welcome_text,
+                    parse_mode='HTML',
+                    reply_markup=self.get_admin_menu()
+                )
+            else:
+                await update.message.reply_text(
+                    welcome_text,
+                    parse_mode='HTML',
+                    reply_markup=self.get_main_menu()
+                )
         else:
             currency_info = Config.CURRENCIES.get(db_user.currency, Config.CURRENCIES['USD'])
             role_emoji = "💼" if db_user.role == "client" else "💻" if db_user.role == "freelancer" else "🔀"
-            await update.message.reply_text(
-                f"👋 Welcome back, {user.full_name}!\n\n"
+            
+            welcome_back = (
+                f"👋 <b>Welcome back, {user.full_name}!</b>\n\n"
                 f"{role_emoji} Role: {db_user.role.title()}\n"
                 f"{currency_info['emoji']} Currency: {db_user.currency} ({currency_info['symbol']})\n"
                 f"⭐ Rating: {self.get_average_rating(user.id):.1f}/5.0\n"
                 f"📊 Reports: {db_user.report_count}/{Config.REPORT_THRESHOLD}\n\n"
-                f"Select an option below:",
-                reply_markup=self.get_main_menu(is_admin)
+                "Select an option below:"
             )
+            
+            if is_admin:
+                await update.message.reply_text(
+                    welcome_back,
+                    parse_mode='HTML',
+                    reply_markup=self.get_admin_menu()
+                )
+            else:
+                await update.message.reply_text(
+                    welcome_back,
+                    parse_mode='HTML',
+                    reply_markup=self.get_main_menu()
+                )
         session.close()
 
     # ==================== TEXT HANDLER ====================
@@ -424,7 +452,8 @@ class FreelanceBot:
                 context.user_data['title'] = text
                 context.user_data['step'] = 'description'
                 await update.message.reply_text(
-                    "Great! Now enter a **description** of the job:",
+                    "Great! Now enter a <b>description</b> of the job:",
+                    parse_mode='HTML',
                     reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Cancel", callback_data="main_menu")]])
                 )
             
@@ -432,7 +461,8 @@ class FreelanceBot:
                 context.user_data['description'] = text
                 context.user_data['step'] = 'category'
                 await update.message.reply_text(
-                    "Choose a **category**:",
+                    "Choose a <b>category</b>:",
+                    parse_mode='HTML',
                     reply_markup=self.get_categories_keyboard()
                 )
             
@@ -443,7 +473,8 @@ class FreelanceBot:
                     context.user_data['budget_min'] = 0
                 context.user_data['step'] = 'budget_max'
                 await update.message.reply_text(
-                    "Enter the **maximum budget** (or type '0'):",
+                    "Enter the <b>maximum budget</b> (or type '0'):",
+                    parse_mode='HTML',
                     reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Cancel", callback_data="main_menu")]])
                 )
             
@@ -475,26 +506,45 @@ class FreelanceBot:
         elif context.user_data.get('unban_payment'):
             await self.handle_unban_payment(update, context, text)
         
-        # Handle broadcast caption
+        # Handle broadcast
         elif context.user_data.get('broadcast'):
-            await self.broadcast_caption(update, context, text)
+            if context.user_data.get('broadcast_step') == 'caption':
+                await self.broadcast_caption(update, context, text)
+            elif context.user_data.get('broadcast_step') == 'buttons':
+                await self.broadcast_buttons(update, context, text)
+        
+        # Handle admin unban by ID
+        elif context.user_data.get('admin_unban'):
+            await self.admin_unban_by_id(update, context, text)
         
         else:
             is_admin = update.effective_user.id in Config.ADMIN_IDS
-            await update.message.reply_text(
-                "Please use the buttons to navigate.",
-                reply_markup=self.get_main_menu(is_admin)
-            )
+            if is_admin:
+                await update.message.reply_text(
+                    "Please use the buttons to navigate.",
+                    reply_markup=self.get_admin_menu()
+                )
+            else:
+                await update.message.reply_text(
+                    "Please use the buttons to navigate.",
+                    reply_markup=self.get_main_menu()
+                )
 
     async def photo_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if context.user_data.get('broadcast'):
             await self.broadcast_photo(update, context)
         else:
             is_admin = update.effective_user.id in Config.ADMIN_IDS
-            await update.message.reply_text(
-                "Please use the buttons to navigate.",
-                reply_markup=self.get_main_menu(is_admin)
-            )
+            if is_admin:
+                await update.message.reply_text(
+                    "Please use the buttons to navigate.",
+                    reply_markup=self.get_admin_menu()
+                )
+            else:
+                await update.message.reply_text(
+                    "Please use the buttons to navigate.",
+                    reply_markup=self.get_main_menu()
+                )
 
     # ==================== SAVE JOB ====================
     async def save_job(self, update: Update, context: ContextTypes.DEFAULT_TYPE, contact_info):
@@ -523,13 +573,13 @@ class FreelanceBot:
         max_str = f"{currency_info['symbol']}{job.budget_max:,.2f}" if job.budget_max > 0 else "No max"
         
         await update.message.reply_text(
-            f"✅ **Job posted successfully!**\n\n"
-            f"📌 **Title:** {job.title}\n"
-            f"📂 **Category:** {job.category}\n"
-            f"💰 **Budget:** {min_str} - {max_str} ({currency})\n"
-            f"📞 **Contact:** {job.contact_method}\n\n"
-            f"Freelancers can now view and apply to this job!",
-            parse_mode='Markdown',
+            f"✅ <b>Job posted successfully!</b>\n\n"
+            f"<b>Title:</b> {job.title}\n"
+            f"<b>Category:</b> {job.category}\n"
+            f"<b>Budget:</b> {min_str} - {max_str} ({currency})\n"
+            f"<b>Contact:</b> {job.contact_method}\n\n"
+            "Freelancers can now view and apply to this job!",
+            parse_mode='HTML',
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("📋 Browse Jobs", callback_data="browse_jobs")],
                 [InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]
@@ -585,11 +635,11 @@ class FreelanceBot:
             reported_user.report_count += 1
             
             warning_message = (
-                f"⚠️ **Warning!**\n\n"
+                f"⚠️ <b>Warning!</b>\n\n"
                 f"You have received a scam report from another user.\n"
-                f"**Report #{reported_user.report_count} of {Config.REPORT_THRESHOLD}**\n\n"
+                f"<b>Report #{reported_user.report_count} of {Config.REPORT_THRESHOLD}</b>\n\n"
                 f"Reason: {reason[:200]}\n\n"
-                f"If you receive {Config.REPORT_THRESHOLD} reports, you will be **banned** "
+                f"If you receive {Config.REPORT_THRESHOLD} reports, you will be <b>banned</b> "
                 f"and required to pay {Config.UNBAN_FEE} Stars to unban."
             )
             
@@ -597,7 +647,7 @@ class FreelanceBot:
                 await context.bot.send_message(
                     chat_id=reported_id,
                     text=warning_message,
-                    parse_mode='Markdown'
+                    parse_mode='HTML'
                 )
                 report.warning_sent = True
             except:
@@ -610,26 +660,26 @@ class FreelanceBot:
                 await context.bot.send_message(
                     chat_id=reported_id,
                     text=(
-                        f"🚫 **You have been BANNED!**\n\n"
+                        f"🚫 <b>You have been BANNED!</b>\n\n"
                         f"You received {Config.REPORT_THRESHOLD} scam reports.\n"
                         f"To unban, send {Config.UNBAN_FEE} Stars as a gift to:\n"
-                        f"**@{Config.RECEIVER_USERNAME}**\n\n"
-                        f"Use /start when you're ready to pay."
+                        f"<b>@{Config.RECEIVER_USERNAME}</b>\n\n"
+                        "Use /start when you're ready to pay."
                     ),
-                    parse_mode='Markdown'
+                    parse_mode='HTML'
                 )
                 
                 for admin_id in Config.ADMIN_IDS:
                     await context.bot.send_message(
                         chat_id=admin_id,
                         text=(
-                            f"🚨 **User BANNED Automatically**\n\n"
+                            f"🚨 <b>User BANNED Automatically</b>\n\n"
                             f"User: {reported_user.full_name} (@{reported_user.username})\n"
                             f"ID: {reported_user.telegram_id}\n"
                             f"Reports: {reported_user.report_count}\n"
                             f"Reason: {reason[:200]}"
                         ),
-                        parse_mode='Markdown'
+                        parse_mode='HTML'
                     )
         
         session.commit()
@@ -671,22 +721,23 @@ class FreelanceBot:
                 await context.bot.send_message(
                     chat_id=admin_id,
                     text=(
-                        f"💰 **New Unban Payment Request**\n\n"
+                        f"💰 <b>New Unban Payment Request</b>\n\n"
                         f"User: {user.full_name} (@{user.username or 'No username'})\n"
                         f"ID: {user.telegram_id}\n"
                         f"Amount: {Config.UNBAN_FEE} Stars\n"
                         f"Proof: {proof[:500]}"
                     ),
-                    parse_mode='Markdown'
+                    parse_mode='HTML'
                 )
             except:
                 pass
         
         await update.message.reply_text(
-            f"✅ **Payment proof received!**\n\n"
+            f"✅ <b>Payment proof received!</b>\n\n"
             f"An admin will verify your payment and unban you shortly.\n\n"
             f"💰 Amount: {Config.UNBAN_FEE} Stars\n\n"
             f"⏳ Please wait for admin confirmation.",
+            parse_mode='HTML',
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("🔄 Check Status", callback_data="check_payment")],
                 [InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]
@@ -696,29 +747,95 @@ class FreelanceBot:
         session.close()
         context.user_data.clear()
 
+    # ==================== CHECK PAYMENT ====================
+    async def check_payment(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        session = Session()
+        user = session.query(User).filter_by(telegram_id=user_id).first()
+        
+        if not user:
+            await update.callback_query.edit_message_text(
+                "Please use /start first!",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]])
+            )
+            session.close()
+            return
+        
+        if not user.is_banned:
+            await update.callback_query.edit_message_text(
+                "✅ You're not banned!",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]])
+            )
+            session.close()
+            return
+        
+        payment = session.query(UnbanPayment).filter_by(user_id=user_id, status='completed').order_by(UnbanPayment.created_at.desc()).first()
+        
+        if payment:
+            await update.callback_query.edit_message_text(
+                f"✅ <b>Payment Status: Completed</b>\n\n"
+                f"Amount: {payment.amount} Stars\n"
+                f"Date: {payment.completed_at.strftime('%Y-%m-%d %H:%M')}\n\n"
+                f"You are now unbanned!",
+                parse_mode='HTML',
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]])
+            )
+        else:
+            pending = session.query(UnbanPayment).filter_by(user_id=user_id, status='pending').order_by(UnbanPayment.created_at.desc()).first()
+            if pending:
+                await update.callback_query.edit_message_text(
+                    f"⏳ <b>Payment Status: Pending</b>\n\n"
+                    f"Amount: {pending.amount} Stars\n"
+                    f"Submitted: {pending.created_at.strftime('%Y-%m-%d %H:%M')}\n\n"
+                    f"Please wait for admin confirmation.",
+                    parse_mode='HTML',
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]])
+                )
+            else:
+                await update.callback_query.edit_message_text(
+                    f"💰 <b>No payment found</b>\n\n"
+                    f"To unban, send {Config.UNBAN_FEE} Stars as a gift to:\n"
+                    f"<b>@{Config.RECEIVER_USERNAME}</b>\n\n"
+                    f"Then click 'I've Sent the Stars' button.",
+                    parse_mode='HTML',
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton(f"⭐ Send {Config.UNBAN_FEE} Stars", url=f"https://t.me/{Config.RECEIVER_USERNAME}")],
+                        [InlineKeyboardButton("✅ I've Sent the Stars", callback_data="pay_unban")],
+                        [InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]
+                    ])
+                )
+        
+        session.close()
+
     # ==================== BROADCAST ====================
     async def broadcast_start_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['broadcast'] = True
+        context.user_data['broadcast_step'] = 'photo'
         await update.callback_query.edit_message_text(
-            "📢 **Send Broadcast**\n\n"
-            "Please send a **photo** for the broadcast (or type 'skip' for text-only):",
+            "📢 <b>Send Broadcast</b>\n\n"
+            "Please send a <b>photo</b> for the broadcast (or type 'skip' for text-only):",
+            parse_mode='HTML',
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Cancel", callback_data="admin_panel")]])
         )
 
     async def broadcast_photo(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if update.message.text and update.message.text.lower() == 'skip':
             context.user_data['broadcast_photo'] = None
+            context.user_data['broadcast_step'] = 'caption'
             await update.message.reply_text(
-                "Now send the **caption** for the message:\n"
-                "(You can use HTML formatting: <b>bold</b>, <i>italic</i>)"
+                "Now send the <b>caption</b> for the message:\n"
+                "(You can use HTML formatting: &lt;b&gt;bold&lt;/b&gt;, &lt;i&gt;italic&lt;/i&gt;)",
+                parse_mode='HTML'
             )
             return
         
         if update.message.photo:
             context.user_data['broadcast_photo'] = update.message.photo[-1].file_id
+            context.user_data['broadcast_step'] = 'caption'
             await update.message.reply_text(
                 "✅ Photo received!\n\n"
-                "Now send the **caption** for the message:"
+                "Now send the <b>caption</b> for the message:",
+                parse_mode='HTML'
             )
         else:
             await update.message.reply_text("Please send a photo or type 'skip'.")
@@ -728,10 +845,11 @@ class FreelanceBot:
         context.user_data['broadcast_step'] = 'buttons'
         
         await update.message.reply_text(
-            "Now send the **button configuration** (or type 'skip' for no buttons):\n\n"
-            "Format: `Button Text | URL`\n"
-            "Example: `Join Channel | https://t.me/yourchannel`\n"
-            "You can send multiple buttons on separate lines."
+            "Now send the <b>button configuration</b> (or type 'skip' for no buttons):\n\n"
+            "Format: <code>Button Text | URL</code>\n"
+            "Example: <code>Join Channel | https://t.me/yourchannel</code>\n"
+            "You can send multiple buttons on separate lines.",
+            parse_mode='HTML'
         )
 
     async def broadcast_buttons(self, update: Update, context: ContextTypes.DEFAULT_TYPE, text):
@@ -742,7 +860,6 @@ class FreelanceBot:
                     btn_text, url = line.split('|', 1)
                     buttons.append([InlineKeyboardButton(btn_text.strip(), url=url.strip())])
         
-        # Send broadcast
         session = Session()
         users = session.query(User).all()
         session.close()
@@ -776,7 +893,6 @@ class FreelanceBot:
             
             await asyncio.sleep(0.05)
         
-        # Save broadcast record
         session = Session()
         broadcast = BroadcastMessage(
             admin_id=update.effective_user.id,
@@ -791,72 +907,93 @@ class FreelanceBot:
         session.close()
         
         await progress_msg.edit_text(
-            f"✅ **Broadcast Complete!**\n\n"
+            f"✅ <b>Broadcast Complete!</b>\n\n"
             f"📤 Sent: {sent}\n"
             f"❌ Failed: {failed}\n"
             f"📊 Total: {len(users)} users",
+            parse_mode='HTML',
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")]])
         )
         
         context.user_data.clear()
 
-    # ==================== CHECK PAYMENT ====================
-    async def check_payment(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user_id = update.effective_user.id
+    # ==================== ADMIN UNBAN BY ID ====================
+    async def admin_unban_by_id(self, update: Update, context: ContextTypes.DEFAULT_TYPE, text):
+        try:
+            target_id = int(text.strip())
+        except:
+            await update.message.reply_text(
+                "❌ Invalid ID. Please enter a valid Telegram ID (numbers only).",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_panel")]])
+            )
+            context.user_data.clear()
+            return
+        
         session = Session()
-        user = session.query(User).filter_by(telegram_id=user_id).first()
+        user = session.query(User).filter_by(telegram_id=target_id).first()
         
         if not user:
-            await update.callback_query.edit_message_text(
-                "Please use /start first!",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]])
+            await update.message.reply_text(
+                "❌ User not found.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_panel")]])
             )
             session.close()
+            context.user_data.clear()
             return
         
         if not user.is_banned:
-            await update.callback_query.edit_message_text(
-                "✅ You're not banned!",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]])
+            await update.message.reply_text(
+                f"✅ User {user.full_name} is not banned.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_panel")]])
             )
             session.close()
+            context.user_data.clear()
             return
         
-        payment = session.query(UnbanPayment).filter_by(user_id=user_id, status='completed').order_by(UnbanPayment.created_at.desc()).first()
+        # Unban the user
+        user.is_banned = False
+        user.ban_reason = None
+        user.ban_count += 1
+        user.report_count = 0
         
-        if payment:
-            await update.callback_query.edit_message_text(
-                f"✅ **Payment Status: Completed**\n\n"
-                f"Amount: {payment.amount} Stars\n"
-                f"Date: {payment.completed_at.strftime('%Y-%m-%d %H:%M')}\n\n"
-                f"You are now unbanned!",
+        session.commit()
+        
+        # Notify the user
+        try:
+            await context.bot.send_message(
+                chat_id=target_id,
+                text=(
+                    f"✅ <b>You have been unbanned by an admin!</b>\n\n"
+                    f"Welcome back! Please follow the rules to avoid being banned again.\n"
+                    f"This was your {user.ban_count} ban."
+                ),
+                parse_mode='HTML',
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]])
             )
-        else:
-            pending = session.query(UnbanPayment).filter_by(user_id=user_id, status='pending').order_by(UnbanPayment.created_at.desc()).first()
-            if pending:
-                await update.callback_query.edit_message_text(
-                    f"⏳ **Payment Status: Pending**\n\n"
-                    f"Amount: {pending.amount} Stars\n"
-                    f"Submitted: {pending.created_at.strftime('%Y-%m-%d %H:%M')}\n\n"
-                    f"Please wait for admin confirmation.",
-                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]])
-                )
-            else:
-                await update.callback_query.edit_message_text(
-                    f"💰 **No payment found**\n\n"
-                    f"To unban, send {Config.UNBAN_FEE} Stars as a gift to:\n"
-                    f"**@{Config.RECEIVER_USERNAME}**\n\n"
-                    f"Then click 'I've Sent the Stars' button.",
-                    parse_mode='Markdown',
-                    reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton(f"⭐ Send {Config.UNBAN_FEE} Stars", url=f"https://t.me/{Config.RECEIVER_USERNAME}")],
-                        [InlineKeyboardButton("✅ I've Sent the Stars", callback_data="pay_unban")],
-                        [InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]
-                    ])
-                )
+        except:
+            pass
+        
+        await update.message.reply_text(
+            f"✅ <b>User Unbanned Successfully!</b>\n\n"
+            f"User: {user.full_name} (@{user.username or 'No username'})\n"
+            f"ID: {user.telegram_id}\n"
+            f"Ban count: {user.ban_count}",
+            parse_mode='HTML',
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_panel")]])
+        )
         
         session.close()
+        context.user_data.clear()
+
+    # ==================== GET AVERAGE RATING ====================
+    def get_average_rating(self, user_id):
+        session = Session()
+        ratings = session.query(Rating).filter_by(reviewee_id=user_id).all()
+        session.close()
+        if not ratings:
+            return 0.0
+        avg = sum(r.rating for r in ratings) / len(ratings)
+        return round(avg, 1)
 
     # ==================== CALLBACK HANDLER ====================
     async def callback_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -869,33 +1006,41 @@ class FreelanceBot:
         
         # ===== MAIN MENU =====
         if data == "main_menu":
-            await query.edit_message_text(
-                "🏠 **Main Menu**\n\n"
-                "Select an option below:",
-                parse_mode='Markdown',
-                reply_markup=self.get_main_menu(is_admin)
-            )
+            if is_admin:
+                await query.edit_message_text(
+                    "🏠 <b>Main Menu</b>\n\n"
+                    "Select an option below:",
+                    parse_mode='HTML',
+                    reply_markup=self.get_admin_menu()
+                )
+            else:
+                await query.edit_message_text(
+                    "🏠 <b>Main Menu</b>\n\n"
+                    "Select an option below:",
+                    parse_mode='HTML',
+                    reply_markup=self.get_main_menu()
+                )
             return
         
         # ===== HELP =====
         elif data == "help":
             await query.edit_message_text(
-                "🤖 **FreelanceHub Bot - Help**\n\n"
-                "📌 **What you can do:**\n"
+                "🤖 <b>FreelanceHub Bot - Help</b>\n\n"
+                "<b>What you can do:</b>\n"
                 "• Browse and apply for jobs\n"
                 "• Post your own jobs\n"
                 "• Rate other users\n"
                 "• Report scammers\n"
                 "• Manage your profile\n\n"
-                "💰 **Currencies Supported:**\n"
+                "<b>Currencies Supported:</b>\n"
                 + "\n".join([f"{data['emoji']} {code} ({data['symbol']})" 
                             for code, data in list(Config.CURRENCIES.items())[:6]]) +
-                "\n\n📌 **How it works:**\n"
+                "\n\n<b>How it works:</b>\n"
                 "1. Clients post jobs\n"
                 "2. Freelancers browse and apply\n"
                 "3. Connect directly\n\n"
                 "⚠️ Always verify identities!",
-                parse_mode='Markdown',
+                parse_mode='HTML',
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="main_menu")]])
             )
             return
@@ -908,8 +1053,9 @@ class FreelanceBot:
             
             if user:
                 await query.edit_message_text(
-                    "⚙️ **Settings**\n\n"
-                    f"Current settings:",
+                    "⚙️ <b>Settings</b>\n\n"
+                    "Current settings:",
+                    parse_mode='HTML',
                     reply_markup=self.get_settings_menu(user)
                 )
             return
@@ -928,9 +1074,9 @@ class FreelanceBot:
             session.close()
             
             await query.edit_message_text(
-                "💰 **Select your preferred currency**\n\n"
+                "💰 <b>Select your preferred currency</b>\n\n"
                 f"Current: {Config.CURRENCIES[current]['emoji']} {current}",
-                parse_mode='Markdown',
+                parse_mode='HTML',
                 reply_markup=self.get_currency_keyboard(current)
             )
             return
@@ -982,7 +1128,7 @@ class FreelanceBot:
             currency_info = Config.CURRENCIES.get(user.currency, Config.CURRENCIES['USD'])
             
             profile_text = (
-                f"👤 **Profile**\n\n"
+                f"👤 <b>Profile</b>\n\n"
                 f"Name: {user.full_name}\n"
                 f"Username: @{user.username or 'Not set'}\n"
                 f"Role: {user.role.title()}\n"
@@ -1000,7 +1146,7 @@ class FreelanceBot:
             
             await query.edit_message_text(
                 profile_text,
-                parse_mode='Markdown',
+                parse_mode='HTML',
                 reply_markup=InlineKeyboardMarkup(keyboard)
             )
             session.close()
@@ -1023,8 +1169,9 @@ class FreelanceBot:
                 
             if user.role not in ['client', 'both']:
                 await query.edit_message_text(
-                    "❌ You need to be a **Client** to post jobs!\n"
+                    "❌ You need to be a <b>Client</b> to post jobs!\n"
                     "Change your role in Settings.",
+                    parse_mode='HTML',
                     reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⚙️ Settings", callback_data="settings")]])
                 )
                 session.close()
@@ -1036,9 +1183,9 @@ class FreelanceBot:
             session.close()
             
             await query.edit_message_text(
-                "📝 **Create Job Listing**\n\n"
-                "Please enter the **job title**:",
-                parse_mode='Markdown',
+                "📝 <b>Create Job Listing</b>\n\n"
+                "Please enter the <b>job title</b>:",
+                parse_mode='HTML',
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Cancel", callback_data="main_menu")]])
             )
             return
@@ -1051,7 +1198,8 @@ class FreelanceBot:
             
             await query.edit_message_text(
                 f"✅ Category: {category}\n\n"
-                "Now enter the **minimum budget** (or type '0'):",
+                "Now enter the <b>minimum budget</b> (or type '0'):",
+                parse_mode='HTML',
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Cancel", callback_data="main_menu")]])
             )
             return
@@ -1064,7 +1212,8 @@ class FreelanceBot:
             
             await query.edit_message_text(
                 f"✅ Contact method: {method}\n\n"
-                f"Please enter your **{method}** contact info:",
+                f"Please enter your <b>{method}</b> contact info:",
+                parse_mode='HTML',
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Cancel", callback_data="main_menu")]])
             )
             return
@@ -1086,8 +1235,9 @@ class FreelanceBot:
                 
             if user.role not in ['freelancer', 'both']:
                 await query.edit_message_text(
-                    "❌ You need to be a **Freelancer** to browse jobs!\n"
+                    "❌ You need to be a <b>Freelancer</b> to browse jobs!\n"
                     "Change your role in Settings.",
+                    parse_mode='HTML',
                     reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⚙️ Settings", callback_data="settings")]])
                 )
                 session.close()
@@ -1115,19 +1265,20 @@ class FreelanceBot:
                 max_str = f"{currency_info['symbol']}{job.budget_max:,.2f}" if job.budget_max > 0 else "No max"
                 
                 await query.message.reply_text(
-                    f"📌 **{job.title}**\n"
+                    f"📌 <b>{job.title}</b>\n"
                     f"📂 Category: {job.category}\n"
                     f"💰 Budget: {min_str} - {max_str} ({job.currency})\n"
                     f"📝 {job.description[:150]}...\n\n"
                     f"👤 Client: {poster.full_name if poster else 'Unknown'}\n"
                     f"⭐ Rating: {avg_rating:.1f}/5.0\n"
                     f"📅 Posted: {job.created_at.strftime('%Y-%m-%d')}",
-                    parse_mode='Markdown',
+                    parse_mode='HTML',
                     reply_markup=self.get_job_actions_keyboard(job.id, job.poster_id)
                 )
             
             await query.message.reply_text(
-                "📋 **Showing latest 5 jobs**",
+                "📋 <b>Showing latest 5 jobs</b>",
+                parse_mode='HTML',
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("🔄 Refresh", callback_data="browse_jobs")],
                     [InlineKeyboardButton("🔙 Back to Menu", callback_data="main_menu")]
@@ -1151,13 +1302,13 @@ class FreelanceBot:
             session.close()
             
             await query.edit_message_text(
-                f"✅ **Contact Details**\n\n"
+                f"✅ <b>Contact Details</b>\n\n"
                 f"Job: {job.title}\n\n"
-                f"📞 **Contact Method:** {poster.contact_method}\n"
-                f"📱 **Contact Info:** {poster.contact_info}\n\n"
+                f"📞 <b>Contact Method:</b> {poster.contact_method}\n"
+                f"📱 <b>Contact Info:</b> {poster.contact_info}\n\n"
                 f"💡 Tip: Mention the job title when contacting!\n"
                 f"⚠️ Always verify identities!",
-                parse_mode='Markdown',
+                parse_mode='HTML',
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("📝 Rate Client", callback_data=f"rate_{job.poster_id}_{job.id}")],
                     [InlineKeyboardButton("🚨 Report Scam", callback_data=f"report_{job.poster_id}_{job.id}")],
@@ -1213,12 +1364,13 @@ class FreelanceBot:
             context.user_data['report_job'] = job_id
             
             await query.edit_message_text(
-                "🚨 **Report User for Scam**\n\n"
+                "🚨 <b>Report User for Scam</b>\n\n"
                 "Please describe what happened:\n"
                 "- What did they do?\n"
                 "- Any evidence?\n"
                 "- Amount lost?\n\n"
                 "Be as detailed as possible.",
+                parse_mode='HTML',
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Cancel", callback_data="browse_jobs")]])
             )
             return
@@ -1231,8 +1383,9 @@ class FreelanceBot:
             
             if not jobs:
                 await query.edit_message_text(
-                    "📋 **Your Jobs**\n\n"
+                    "📋 <b>Your Jobs</b>\n\n"
                     "You haven't posted any jobs yet.",
+                    parse_mode='HTML',
                     reply_markup=InlineKeyboardMarkup([
                         [InlineKeyboardButton("💰 Post a Job", callback_data="post_job")],
                         [InlineKeyboardButton("🔙 Back", callback_data="main_menu")]
@@ -1240,7 +1393,7 @@ class FreelanceBot:
                 )
                 return
             
-            message = "📋 **Your Active Jobs:**\n\n"
+            message = "📋 <b>Your Active Jobs:</b>\n\n"
             for job in jobs:
                 currency_info = Config.CURRENCIES.get(job.currency, Config.CURRENCIES['USD'])
                 min_str = f"{currency_info['symbol']}{job.budget_min:,.2f}"
@@ -1256,7 +1409,7 @@ class FreelanceBot:
             
             await query.edit_message_text(
                 message,
-                parse_mode='Markdown',
+                parse_mode='HTML',
                 reply_markup=InlineKeyboardMarkup(keyboard)
             )
             return
@@ -1295,14 +1448,14 @@ class FreelanceBot:
             context.user_data['unban_payment'] = True
             
             await query.edit_message_text(
-                f"💰 **Unban Payment Process**\n\n"
-                f"1. Send **{Config.UNBAN_FEE} Stars** as a gift to:\n"
-                f"   **@{Config.RECEIVER_USERNAME}**\n\n"
-                f"2. After sending, type your **gift message** or **screenshot** here\n"
+                f"💰 <b>Unban Payment Process</b>\n\n"
+                f"1. Send <b>{Config.UNBAN_FEE} Stars</b> as a gift to:\n"
+                f"   <b>@{Config.RECEIVER_USERNAME}</b>\n\n"
+                f"2. After sending, type your <b>gift message</b> or <b>screenshot</b> here\n"
                 f"   (Any proof of payment)\n\n"
                 f"3. An admin will verify and unban you\n\n"
                 f"📝 Type your payment proof below:",
-                parse_mode='Markdown',
+                parse_mode='HTML',
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Cancel", callback_data="main_menu")]])
             )
             session.close()
@@ -1319,10 +1472,27 @@ class FreelanceBot:
                 return
             
             await query.edit_message_text(
-                "👑 **Admin Panel**\n\n"
+                "👑 <b>Admin Panel</b>\n\n"
                 "Select an option below:",
-                parse_mode='Markdown',
+                parse_mode='HTML',
                 reply_markup=self.get_admin_menu()
+            )
+            return
+        
+        # ===== ADMIN UNBAN =====
+        elif data == "admin_unban":
+            if not is_admin:
+                await query.edit_message_text("❌ You are not an admin.")
+                return
+            
+            context.user_data['admin_unban'] = True
+            
+            await query.edit_message_text(
+                "🔓 <b>Unban User</b>\n\n"
+                "Please enter the <b>Telegram ID</b> of the user you want to unban:\n\n"
+                "You can find the ID in user profiles or reports.",
+                parse_mode='HTML',
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Cancel", callback_data="admin_panel")]])
             )
             return
         
@@ -1346,13 +1516,13 @@ class FreelanceBot:
             session.close()
             
             await query.edit_message_text(
-                f"📊 **Statistics**\n\n"
+                f"📊 <b>Statistics</b>\n\n"
                 f"👤 Users: {total_users} (Banned: {banned_users})\n"
                 f"📋 Reports: {total_reports} (Pending: {pending_reports})\n"
                 f"💼 Jobs: {total_jobs} (Active: {active_jobs})\n"
                 f"⭐ Ratings: {total_ratings}\n"
                 f"💰 Payments: {total_payments} (Pending: {pending_payments}, Completed: {completed_payments})",
-                parse_mode='Markdown',
+                parse_mode='HTML',
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_panel")]])
             )
             return
@@ -1389,8 +1559,9 @@ class FreelanceBot:
                 reports_with_users.append((user, report))
             
             await query.edit_message_text(
-                f"📋 **Pending Reports ({len(pending_reports)})**\n\n"
+                f"📋 <b>Pending Reports ({len(pending_reports)})</b>\n\n"
                 "Click a report to view details:",
+                parse_mode='HTML',
                 reply_markup=self.get_reports_menu(reports_with_users)
             )
             session.close()
@@ -1415,13 +1586,13 @@ class FreelanceBot:
             reported = session.query(User).filter_by(telegram_id=report.reported_id).first()
             
             await query.edit_message_text(
-                f"📋 **Report #{report.id}**\n\n"
+                f"📋 <b>Report #{report.id}</b>\n\n"
                 f"Reporter: {reporter.full_name} (@{reporter.username or 'No username'})\n"
                 f"Reported: {reported.full_name} (@{reported.username or 'No username'})\n"
                 f"Status: {report.status}\n"
                 f"Date: {report.created_at.strftime('%Y-%m-%d %H:%M')}\n\n"
-                f"**Reason:**\n{report.reason[:500]}",
-                parse_mode='Markdown',
+                f"<b>Reason:</b>\n{report.reason[:500]}",
+                parse_mode='HTML',
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("✅ Resolve", callback_data=f"resolve_report_{report.id}")],
                     [InlineKeyboardButton("❌ Dismiss", callback_data=f"dismiss_report_{report.id}")],
@@ -1498,8 +1669,9 @@ class FreelanceBot:
                 payments_with_users.append((user, payment))
             
             await query.edit_message_text(
-                f"💰 **Pending Unban Payments ({len(pending_payments)})**\n\n"
+                f"💰 <b>Pending Unban Payments ({len(pending_payments)})</b>\n\n"
                 "Click a payment to view:",
+                parse_mode='HTML',
                 reply_markup=self.get_payments_menu(payments_with_users)
             )
             session.close()
@@ -1523,12 +1695,12 @@ class FreelanceBot:
             user = session.query(User).filter_by(telegram_id=payment.user_id).first()
             
             await query.edit_message_text(
-                f"💰 **Payment #{payment.id}**\n\n"
+                f"💰 <b>Payment #{payment.id}</b>\n\n"
                 f"User: {user.full_name} (@{user.username or 'No username'})\n"
                 f"Amount: {payment.amount} Stars\n"
                 f"Status: {payment.status}\n"
                 f"Date: {payment.created_at.strftime('%Y-%m-%d %H:%M')}",
-                parse_mode='Markdown',
+                parse_mode='HTML',
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("✅ Confirm & Unban", callback_data=f"confirm_payment_{payment.id}")],
                     [InlineKeyboardButton("🔙 Back to Payments", callback_data="admin_payments")]
@@ -1567,11 +1739,11 @@ class FreelanceBot:
                     await context.bot.send_message(
                         chat_id=user.telegram_id,
                         text=(
-                            f"✅ **You have been unbanned!**\n\n"
+                            f"✅ <b>You have been unbanned!</b>\n\n"
                             f"Welcome back! Please follow the rules.\n"
                             f"This was your {user.ban_count} ban."
                         ),
-                        parse_mode='Markdown',
+                        parse_mode='HTML',
                         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]])
                     )
                 except:
@@ -1605,8 +1777,9 @@ class FreelanceBot:
                 return
             
             await query.edit_message_text(
-                "👥 **Recent Users**\n\n"
+                "👥 <b>Recent Users</b>\n\n"
                 "Click a user to manage:",
+                parse_mode='HTML',
                 reply_markup=self.get_users_menu(users)
             )
             return
@@ -1629,7 +1802,7 @@ class FreelanceBot:
             avg_rating = self.get_average_rating(target_id)
             
             await query.edit_message_text(
-                f"👤 **User Details**\n\n"
+                f"👤 <b>User Details</b>\n\n"
                 f"Name: {user.full_name}\n"
                 f"Username: @{user.username or 'Not set'}\n"
                 f"Role: {user.role.title()}\n"
@@ -1638,7 +1811,7 @@ class FreelanceBot:
                 f"📊 Reports: {user.report_count}\n"
                 f"🚫 Banned: {'Yes' if user.is_banned else 'No'}\n"
                 f"📅 Joined: {user.created_at.strftime('%Y-%m-%d')}",
-                parse_mode='Markdown',
+                parse_mode='HTML',
                 reply_markup=self.get_user_actions_menu(target_id)
             )
             session.close()
@@ -1657,12 +1830,18 @@ class FreelanceBot:
             if user and user.is_banned:
                 user.is_banned = False
                 user.ban_reason = None
+                user.ban_count += 1
+                user.report_count = 0
                 session.commit()
                 
                 try:
                     await context.bot.send_message(
                         chat_id=target_id,
-                        text="✅ You have been unbanned by an admin!",
+                        text=(
+                            f"✅ <b>You have been unbanned by an admin!</b>\n\n"
+                            f"Welcome back! Please follow the rules."
+                        ),
+                        parse_mode='HTML',
                         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]])
                     )
                 except:
@@ -1695,8 +1874,11 @@ class FreelanceBot:
                 try:
                     await context.bot.send_message(
                         chat_id=target_id,
-                        text="🚫 You have been banned by an admin!",
-                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]])
+                        text=(
+                            f"🚫 <b>You have been banned by an admin!</b>\n\n"
+                            f"To unban, contact @{Config.RECEIVER_USERNAME}"
+                        ),
+                        parse_mode='HTML'
                     )
                 except:
                     pass
@@ -1710,50 +1892,21 @@ class FreelanceBot:
             session.close()
             return
         
-        # ===== MAKE ADMIN =====
-        elif data.startswith('make_admin_'):
-            if not is_admin:
-                await query.edit_message_text("❌ You are not an admin.")
-                return
-            
-            target_id = int(data.replace('make_admin_', ''))
-            session = Session()
-            user = session.query(User).filter_by(telegram_id=target_id).first()
-            
-            if user:
-                if target_id in Config.ADMIN_IDS:
-                    await query.edit_message_text("This user is already an admin!")
-                else:
-                    Config.ADMIN_IDS.append(target_id)
-                    session.commit()
-                    await query.edit_message_text(
-                        f"✅ User {user.full_name} is now an admin!",
-                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Users", callback_data="admin_users")]])
-                    )
-            else:
-                await query.edit_message_text("❌ User not found.")
-            session.close()
-            return
-        
         # ===== CHECK JOINED =====
         elif data == "check_joined":
             if await self.check_force_join(update, context):
                 is_admin = update.effective_user.id in Config.ADMIN_IDS
-                await query.edit_message_text(
-                    "✅ Thank you for joining!",
-                    reply_markup=self.get_main_menu(is_admin)
-                )
+                if is_admin:
+                    await query.edit_message_text(
+                        "✅ Thank you for joining!",
+                        reply_markup=self.get_admin_menu()
+                    )
+                else:
+                    await query.edit_message_text(
+                        "✅ Thank you for joining!",
+                        reply_markup=self.get_main_menu()
+                    )
             return
-
-    # ==================== GET AVERAGE RATING ====================
-    def get_average_rating(self, user_id):
-        session = Session()
-        ratings = session.query(Rating).filter_by(reviewee_id=user_id).all()
-        session.close()
-        if not ratings:
-            return 0.0
-        avg = sum(r.rating for r in ratings) / len(ratings)
-        return round(avg, 1)
 
     # ==================== RUN ====================
     def run(self):
