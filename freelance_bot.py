@@ -22,7 +22,6 @@ class Config:
     REPORT_THRESHOLD = 5
     UNBAN_FEE = 50
     
-    # YOUR Telegram account details
     RECEIVER_USERNAME = 'rexoronsaye'
     RECEIVER_TELEGRAM_ID = 7713987088
     
@@ -52,7 +51,6 @@ class Config:
     }
     DEFAULT_CURRENCY = 'USD'
 
-# SQLite database (no DATABASE_URL needed)
 Base = declarative_base()
 engine = create_engine('sqlite:///freelance_bot.db')
 Session = sessionmaker(bind=engine)
@@ -139,10 +137,8 @@ class BroadcastMessage(Base):
     failed_count = Column(Integer, default=0)
     created_at = Column(DateTime, default=datetime.utcnow)
 
-# Create tables
 Base.metadata.create_all(engine)
 
-# Conversation states
 TITLE, DESCRIPTION, CATEGORY, CURRENCY, BUDGET_MIN, BUDGET_MAX, CONTACT_METHOD, CONTACT_INFO = range(8)
 RATING_SCORE, RATING_REVIEW = range(2)
 REPORT_REASON = range(1)
@@ -162,13 +158,8 @@ class FreelanceBot:
         logger.info("Bot initialized successfully!")
         
     def setup_handlers(self):
-        # ONLY /start command - everything else is inline buttons
         self.application.add_handler(CommandHandler('start', self.start))
-        
-        # All functionality via callback queries
         self.application.add_handler(CallbackQueryHandler(self.callback_handler))
-        
-        # Message handlers for conversations
         self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.text_handler))
         self.application.add_handler(MessageHandler(filters.PHOTO, self.photo_handler))
 
@@ -217,7 +208,6 @@ class FreelanceBot:
             [InlineKeyboardButton("⚙️ Settings", callback_data="settings")],
             [InlineKeyboardButton("❓ Help", callback_data="help")]
         ]
-        # Only show Admin Panel button if user is admin
         if is_admin:
             keyboard.append([InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")])
         return InlineKeyboardMarkup(keyboard)
@@ -288,17 +278,17 @@ class FreelanceBot:
 
     def get_contact_keyboard(self):
         keyboard = [
-            [InlineKeyboardButton("📱 Telegram", callback_data="contact_telegram")],
-            [InlineKeyboardButton("📧 Email", callback_data="contact_email")],
-            [InlineKeyboardButton("📞 Phone", callback_data="contact_phone")],
-            [InlineKeyboardButton("💬 Other", callback_data="contact_other")],
+            [InlineKeyboardButton("📱 Telegram", callback_data="contact_method_telegram")],
+            [InlineKeyboardButton("📧 Email", callback_data="contact_method_email")],
+            [InlineKeyboardButton("📞 Phone", callback_data="contact_method_phone")],
+            [InlineKeyboardButton("💬 Other", callback_data="contact_method_other")],
             [InlineKeyboardButton("🔙 Cancel", callback_data="main_menu")]
         ]
         return InlineKeyboardMarkup(keyboard)
 
     def get_job_actions_keyboard(self, job_id, poster_id):
         keyboard = [
-            [InlineKeyboardButton("📞 Contact Client", callback_data=f"contact_{job_id}")],
+            [InlineKeyboardButton("📞 Contact Client", callback_data=f"contact_job_{job_id}")],
             [InlineKeyboardButton("📝 Rate Client", callback_data=f"rate_{poster_id}_{job_id}")],
             [InlineKeyboardButton("🚨 Report Scam", callback_data=f"report_{poster_id}_{job_id}")],
             [InlineKeyboardButton("🔙 Back to Browse", callback_data="browse_jobs")]
@@ -357,15 +347,11 @@ class FreelanceBot:
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = update.effective_user
         
-        # Check force join first
         if not await self.check_force_join(update, context):
             return
         
         session = Session()
-        
         db_user = session.query(User).filter_by(telegram_id=user.id).first()
-        
-        # Check if user is admin
         is_admin = user.id in Config.ADMIN_IDS
         
         if db_user and db_user.is_banned:
@@ -399,13 +385,9 @@ class FreelanceBot:
             session.add(db_user)
             session.commit()
             
-            welcome_text = (
-                f"👋 <b>Welcome to FreelanceHub, {user.full_name}!</b>\n\n"
-                "Use the buttons below to navigate:"
-            )
-            
             await update.message.reply_text(
-                welcome_text,
+                f"👋 <b>Welcome to FreelanceHub, {user.full_name}!</b>\n\n"
+                "Use the buttons below to navigate:",
                 parse_mode='HTML',
                 reply_markup=self.get_main_menu(is_admin)
             )
@@ -413,17 +395,13 @@ class FreelanceBot:
             currency_info = Config.CURRENCIES.get(db_user.currency, Config.CURRENCIES['USD'])
             role_emoji = "💼" if db_user.role == "client" else "💻" if db_user.role == "freelancer" else "🔀"
             
-            welcome_back = (
+            await update.message.reply_text(
                 f"👋 <b>Welcome back, {user.full_name}!</b>\n\n"
                 f"{role_emoji} Role: {db_user.role.title()}\n"
                 f"{currency_info['emoji']} Currency: {db_user.currency} ({currency_info['symbol']})\n"
                 f"⭐ Rating: {self.get_average_rating(user.id):.1f}/5.0\n"
                 f"📊 Reports: {db_user.report_count}/{Config.REPORT_THRESHOLD}\n\n"
-                "Select an option below:"
-            )
-            
-            await update.message.reply_text(
-                welcome_back,
+                "Select an option below:",
                 parse_mode='HTML',
                 reply_markup=self.get_main_menu(is_admin)
             )
@@ -533,6 +511,7 @@ class FreelanceBot:
         
         currency = context.user_data.get('currency', 'USD')
         currency_info = Config.CURRENCIES.get(currency, Config.CURRENCIES['USD'])
+        contact_method = context.user_data.get('contact_method', 'telegram')
         
         job = Job(
             poster_id=user_id,
@@ -542,7 +521,7 @@ class FreelanceBot:
             currency=currency,
             budget_min=context.user_data.get('budget_min', 0),
             budget_max=context.user_data.get('budget_max', 0),
-            contact_method=context.user_data['contact_method'],
+            contact_method=contact_method,
             contact_info=contact_info,
             expires_at=datetime.utcnow() + timedelta(days=30)
         )
@@ -930,7 +909,6 @@ class FreelanceBot:
             context.user_data.clear()
             return
         
-        # Unban the user
         user.is_banned = False
         user.ban_reason = None
         user.ban_count += 1
@@ -938,7 +916,6 @@ class FreelanceBot:
         
         session.commit()
         
-        # Notify the user
         try:
             await context.bot.send_message(
                 chat_id=target_id,
@@ -974,6 +951,37 @@ class FreelanceBot:
             return 0.0
         avg = sum(r.rating for r in ratings) / len(ratings)
         return round(avg, 1)
+
+    # ==================== CONTACT CLIENT ====================
+    async def contact_client(self, job_id, update: Update):
+        session = Session()
+        job = session.query(Job).filter_by(id=job_id, is_active=True).first()
+        
+        if not job:
+            await update.callback_query.edit_message_text(
+                "❌ This job is no longer available.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Browse", callback_data="browse_jobs")]])
+            )
+            session.close()
+            return
+        
+        poster = session.query(User).filter_by(telegram_id=job.poster_id).first()
+        session.close()
+        
+        await update.callback_query.edit_message_text(
+            f"✅ <b>Contact Details</b>\n\n"
+            f"<b>Job:</b> {job.title}\n\n"
+            f"📞 <b>Contact Method:</b> {job.contact_method}\n"
+            f"📱 <b>Contact Info:</b> {job.contact_info}\n\n"
+            f"💡 Tip: Mention the job title when contacting!\n"
+            f"⚠️ Always verify identities!",
+            parse_mode='HTML',
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📝 Rate Client", callback_data=f"rate_{job.poster_id}_{job.id}")],
+                [InlineKeyboardButton("🚨 Report Scam", callback_data=f"report_{job.poster_id}_{job.id}")],
+                [InlineKeyboardButton("🔙 Back to Browse", callback_data="browse_jobs")]
+            ])
+        )
 
     # ==================== CALLBACK HANDLER ====================
     async def callback_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1176,9 +1184,9 @@ class FreelanceBot:
             )
             return
         
-        # ===== CONTACT METHOD =====
-        elif data.startswith('contact_'):
-            method = data.replace('contact_', '')
+        # ===== CONTACT METHOD SELECTION (during job posting) =====
+        elif data.startswith('contact_method_'):
+            method = data.replace('contact_method_', '')
             context.user_data['contact_method'] = method
             context.user_data['step'] = 'contact_info'
             
@@ -1188,6 +1196,12 @@ class FreelanceBot:
                 parse_mode='HTML',
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Cancel", callback_data="main_menu")]])
             )
+            return
+        
+        # ===== CONTACT CLIENT (view job contact info) =====
+        elif data.startswith('contact_job_'):
+            job_id = int(data.replace('contact_job_', ''))
+            await self.contact_client(job_id, update)
             return
         
         # ===== BROWSE JOBS =====
@@ -1257,36 +1271,6 @@ class FreelanceBot:
                 ])
             )
             await query.delete_message()
-            return
-        
-        # ===== CONTACT CLIENT =====
-        elif data.startswith('contact_'):
-            job_id = int(data.replace('contact_', ''))
-            session = Session()
-            job = session.query(Job).filter_by(id=job_id, is_active=True).first()
-            
-            if not job:
-                await query.edit_message_text("❌ This job is no longer available.")
-                session.close()
-                return
-            
-            poster = session.query(User).filter_by(telegram_id=job.poster_id).first()
-            session.close()
-            
-            await query.edit_message_text(
-                f"✅ <b>Contact Details</b>\n\n"
-                f"Job: {job.title}\n\n"
-                f"📞 <b>Contact Method:</b> {poster.contact_method}\n"
-                f"📱 <b>Contact Info:</b> {poster.contact_info}\n\n"
-                f"💡 Tip: Mention the job title when contacting!\n"
-                f"⚠️ Always verify identities!",
-                parse_mode='HTML',
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("📝 Rate Client", callback_data=f"rate_{job.poster_id}_{job.id}")],
-                    [InlineKeyboardButton("🚨 Report Scam", callback_data=f"report_{job.poster_id}_{job.id}")],
-                    [InlineKeyboardButton("🔙 Back to Browse", callback_data="browse_jobs")]
-                ])
-            )
             return
         
         # ===== RATING =====
